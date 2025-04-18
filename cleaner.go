@@ -29,12 +29,13 @@ func (p *ProxyServer) flowCleanerLoop() {
 
 		case <-ticker.C:
 			log.Debug("Flow cleaner ticker fired. Running cleanup cycle.")
+
 			removedCount := p.cleanupClientFlows()
 
 			if removedCount > 0 {
-				log.Infof("Flow cleanup cycle removed %d expired flows.", removedCount)
+				log.Infof("Flow cleanup cycle removed %d potentially leaked/stuck flows.", removedCount)
 			} else {
-				log.Debug("Flow cleanup cycle finished. No expired flows found.")
+				log.Debug("Flow cleanup cycle finished. No stopped flows found in map needing removal.")
 			}
 
 			p.cleanerConfigLock.RLock()
@@ -76,7 +77,9 @@ func (p *ProxyServer) flowCleanerLoop() {
 				newInterval = baseInterval
 				log.Debugf("No active connections with positive timeouts found, using configured base cleaner interval: %v", newInterval)
 			} else {
+
 				newInterval = minTimeout / time.Duration(intervalDivisor)
+
 				if newInterval < minInterval {
 					newInterval = minInterval
 				}
@@ -97,8 +100,6 @@ func (p *ProxyServer) flowCleanerLoop() {
 }
 
 func (p *ProxyServer) cleanupClientFlows() int64 {
-	now := time.Now()
-	nowNanos := now.UnixNano()
 	totalRemovedCount := atomic.Int64{}
 
 	p.routesLock.RLock()
@@ -135,16 +136,7 @@ func (p *ProxyServer) cleanupClientFlows() int64 {
 
 			ar.configLock.RLock()
 			routeName := ar.routeName
-			routeFlowTimeout := ar.flowTimeout
 			ar.configLock.RUnlock()
-
-			if routeFlowTimeout <= 0 {
-				if log.GetLevel() >= logrus.DebugLevel {
-					log.Debugf("Cleanup cycle: Skipping route '%s' due to non-positive timeout (%v).", routeName, routeFlowTimeout)
-				}
-				return
-			}
-			timeoutNanos := routeFlowTimeout.Nanoseconds()
 
 			ar.clientFlows.Range(func(key, value any) bool {
 				clientKey := key.(string)
@@ -152,39 +144,25 @@ func (p *ProxyServer) cleanupClientFlows() int64 {
 
 				select {
 				case <-flow.flowCtx.Done():
-					if log.GetLevel() >= logrus.DebugLevel {
-						log.Debugf("Cleanup cycle: Found already stopped flow for client %s on route '%s'. Ensuring removal.", clientKey, routeName)
-					}
-					ar.clientFlows.Delete(clientKey)
-					return true
-				default:
-				}
+					log.Warnf("Cleanup cycle: Found stopped flow (context done) for client %s on route '%s' still in map. Removing.", clientKey, routeName)
 
-				lastActivityNanos := flow.lastActivity.Load()
-
-				if (nowNanos - lastActivityNanos) > timeoutNanos {
-					log.Infof("Route '%s': Flow for client %s timed out (last activity: %v ago, timeout: %v). Attempting removal.",
-						routeName, clientKey, now.Sub(time.Unix(0, lastActivityNanos)).Round(time.Millisecond), routeFlowTimeout)
-
-					if actualFlowVal, loaded := ar.clientFlows.LoadAndDelete(clientKey); loaded {
-						log.Debugf("Route '%s': Successfully removed flow for client %s from map.", routeName, clientKey)
-						actualFlow := actualFlowVal.(*ClientFlow)
-
-						go actualFlow.Stop()
-
+					if _, loaded := ar.clientFlows.LoadAndDelete(clientKey); loaded {
+						log.Debugf("Cleanup cycle: Successfully removed potentially leaked flow for client %s in %s from map.", clientKey, routeName)
 						routeRemovedCount++
 						totalRemovedCount.Add(1)
+
 					} else {
-						if log.GetLevel() >= logrus.DebugLevel {
-							log.Debugf("Route '%s': Flow for client %s was already removed before cleanup could claim it.", routeName, clientKey)
-						}
+						log.Debugf("Cleanup cycle: Flow for client %s in %s was concurrently removed before cleanup could claim it.", clientKey, routeName)
 					}
+					return true
+				default:
+
+					return true
 				}
-				return true
 			})
 
-			if routeRemovedCount > 0 && log.GetLevel() >= logrus.DebugLevel {
-				log.Debugf("Cleanup cycle: Finished route '%s'. Removed %d expired flows.", routeName, routeRemovedCount)
+			if routeRemovedCount > 0 && log.GetLevel() >= logrus.InfoLevel {
+				log.Infof("Cleanup cycle: Finished route '%s'. Removed %d potentially leaked flows.", routeName, routeRemovedCount)
 			}
 
 		}(route)

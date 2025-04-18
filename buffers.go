@@ -71,12 +71,13 @@ func getPacketBuffer() *packetBuffer {
 		pb.buffer = *bufPtr
 		log.Tracef("getPacketBuffer: Reusing buffer from pool with correct capacity %d.", currentSize)
 	} else {
+
 		if bufPtr == nil {
 			log.Warnf("getPacketBuffer: retrieved nil buffer pointer from pool! Allocating new one with current size %d.", currentSize)
 		} else {
+
 			log.Debugf("getPacketBuffer: Discarding buffer from pool with old capacity %d, allocating new with current size %d.", cap(*bufPtr), currentSize)
 		}
-
 		pb.buffer = make([]byte, currentSize)
 	}
 
@@ -89,14 +90,14 @@ func getPacketBuffer() *packetBuffer {
 
 func putPacketBuffer(pb *packetBuffer) {
 	if pb.buffer != nil {
+
 		udpBufferPool.Put(&pb.buffer)
-	} else {
-		// log.Warnf("putPacketBuffer: pb.buffer is already nil for pb: %+v", pb)
 	}
 
 	pb.Data = nil
 	pb.RemoteAddr = nil
 	pb.N = 0
+	//pb.buffer = nil
 
 	packetBufferPool.Put(pb)
 }

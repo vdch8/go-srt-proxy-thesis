@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -35,7 +34,8 @@ type ProxyServer struct {
 	activeRoutes map[string]*ActiveRoute
 	routesLock   sync.RWMutex
 	globalCtx    context.Context
-	cleanerWg    sync.WaitGroup
+
+	cleanerWg sync.WaitGroup
 
 	cleanerBaseInterval    time.Duration
 	cleanerMinInterval     time.Duration
@@ -159,6 +159,7 @@ func (p *ProxyServer) Start(cfg *Config) error {
 	log.Debug("Validating and resolving routes from configuration...")
 	resolvedRoutes, hasInvalidRoute := p.validateAndResolveNewConfig(cfg)
 	if hasInvalidRoute {
+
 		log.Warn("Start: Found invalid route configurations. Proceeding without them.")
 	}
 
@@ -231,6 +232,7 @@ func (p *ProxyServer) startRouteLocked(routeName string, listenAddr *net.UDPAddr
 	}
 
 	p.activeRoutes[listenAddrStr] = activeRoute
+
 	activeRoute.startProcessing()
 
 	return nil
@@ -269,7 +271,9 @@ func (p *ProxyServer) Reload(newCfg *Config) error {
 		if processFailures {
 			errMsg += " failed to start/update/restart one or more routes;"
 		}
-		return errors.New(errMsg)
+
+		log.Error(errMsg)
+
 	}
 
 	return nil
@@ -321,15 +325,16 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 	uniqueListenAddrs := make(map[string]string)
 
 	for _, routeCfg := range cfg.Streams {
-		if routeCfg.ListenAddress == "" || routeCfg.SourceAddress == "" || routeCfg.Name == "" {
-			log.Errorf("Config Validation: Skipping route due to empty fields: Name='%s', Listen='%s', Source='%s'",
+
+		if routeCfg.Name == "" || routeCfg.ListenAddress == "" || routeCfg.SourceAddress == "" {
+			log.Errorf("Config Validation: Skipping route due to empty required fields: Name='%s', Listen='%s', Source='%s'",
 				routeCfg.Name, routeCfg.ListenAddress, routeCfg.SourceAddress)
 			hasInvalidRoute = true
 			continue
 		}
 
 		if existingName, found := uniqueListenAddrs[routeCfg.ListenAddress]; found {
-			log.Errorf("Config Validation: Duplicate ListenAddress '%s' for routes '%s' and '%s' in new config. Skipping '%s'.",
+			log.Errorf("Config Validation: Duplicate ListenAddress '%s' for routes '%s' and '%s' in new config. Skipping route '%s'.",
 				routeCfg.ListenAddress, existingName, routeCfg.Name, routeCfg.Name)
 			hasInvalidRoute = true
 			continue
@@ -362,7 +367,8 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 			workers:    workers,
 			chanSize:   chanSize,
 		}
-		newRouteConfigs[routeCfg.ListenAddress] = resRoute
+
+		newRouteConfigs[listenAddr.String()] = resRoute
 		uniqueListenAddrs[routeCfg.ListenAddress] = routeCfg.Name
 
 		log.Debugf("Config Validation: Resolved new/updated route '%s': Listen=%s Source=%s Timeout=%v Workers=%d ChanSize=%d",
@@ -372,12 +378,14 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 }
 
 func (p *ProxyServer) stopRemovedRoutesLocked(newRouteConfigs map[string]resolvedRoute) bool {
+
 	currentRouteAddrs := make([]string, 0, len(p.activeRoutes))
 	for listenAddrStr := range p.activeRoutes {
 		currentRouteAddrs = append(currentRouteAddrs, listenAddrStr)
 	}
 
 	routesToStop := []*ActiveRoute{}
+
 	for _, listenAddrStr := range currentRouteAddrs {
 		if _, existsInNew := newRouteConfigs[listenAddrStr]; !existsInNew {
 			if activeRoute, ok := p.activeRoutes[listenAddrStr]; ok {
@@ -387,6 +395,7 @@ func (p *ProxyServer) stopRemovedRoutesLocked(newRouteConfigs map[string]resolve
 				log.Infof("Reload: Marking route '%s' (%s) for stopping (removed from config).",
 					routeName, listenAddrStr)
 				routesToStop = append(routesToStop, activeRoute)
+
 				delete(p.activeRoutes, listenAddrStr)
 			}
 		}
@@ -405,6 +414,8 @@ func (p *ProxyServer) stopRemovedRoutesLocked(newRouteConfigs map[string]resolve
 		}
 		stopWg.Wait()
 		log.Infof("Reload: Finished stopping %d removed routes.", len(routesToStop))
+	} else {
+		log.Debug("Reload: No routes need to be stopped.")
 	}
 	return hasStopFailures
 }
@@ -421,15 +432,18 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 			oldSourceStr := activeRoute.targetSource.String()
 			oldWorkers := activeRoute.numWorkers
 			oldName := activeRoute.routeName
+
 			activeRoute.configLock.RUnlock()
 
-			log.Debugf("Reload: Route '%s' (%s) exists, checking for updates (New: Source=%s, Workers=%d, Name=%s, Timeout=%v, ChanSize=%d)",
-				oldName, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.routeCfg.Name, newRouteData.timeout, newRouteData.chanSize)
+			log.Debugf("Reload: Route '%s' (%s) exists, checking for updates (New: Name='%s' Source=%s, Workers=%d, Timeout=%v, ChanSize=%d)",
+				oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.timeout, newRouteData.chanSize)
 
 			sourceChanged := oldSourceStr != newRouteData.sourceAddr.String()
+
 			workersChanged := oldWorkers != newRouteData.workers
 
 			if sourceChanged || workersChanged {
+
 				reason := ""
 				if sourceChanged {
 					reason += fmt.Sprintf("Source address changed ('%s' -> '%s'). ", oldSourceStr, newRouteData.sourceAddr.String())
@@ -437,8 +451,8 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 				if workersChanged {
 					reason += fmt.Sprintf("Worker count changed (%d -> %d). ", oldWorkers, newRouteData.workers)
 				}
-				log.Infof("Reload: %sRoute '%s' (%s) requires RESTART. Applying new settings (ChanSize: %d).",
-					reason, oldName, listenAddrStr, newRouteData.chanSize)
+				log.Infof("Reload: %sRoute '%s' (%s) requires RESTART. Applying new settings (Name: '%s', ChanSize: %d).",
+					reason, oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.chanSize)
 
 				activeRoute.Stop()
 				delete(p.activeRoutes, listenAddrStr)
@@ -460,6 +474,7 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 					log.Infof("Reload: Route '%s' restarted successfully.", newRouteData.routeCfg.Name)
 				}
 			} else {
+
 				p.updateRouteInPlaceLocked(activeRoute, newRouteData)
 			}
 		} else {
@@ -490,7 +505,7 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 			v.configLock.RUnlock()
 			finalActive = append(finalActive, fmt.Sprintf("'%s'(%s)", rName, k))
 		}
-		log.Debugf("Reload: Final active routes: %v", finalActive)
+		log.Debugf("Reload: Final active routes after processing: %v", finalActive)
 	}
 
 	return hasFailures
@@ -515,16 +530,18 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 	if timeoutChanged {
 		activeRoute.flowTimeout = newRouteData.timeout
 		updatedFieldsLog += fmt.Sprintf(" Timeout: %v->%v", oldTimeout, activeRoute.flowTimeout)
+
 	}
 
 	if updatedFieldsLog != "" {
-		log.Infof("Reload: Updated existing route '%s' (%s):%s", activeRoute.routeName, listenAddrStr, updatedFieldsLog)
+		log.Infof("Reload: Updated existing route '%s' (%s) in-place:%s", activeRoute.routeName, listenAddrStr, updatedFieldsLog)
 	} else {
 		log.Debugf("Reload: Route '%s' (%s) configuration requires no in-place update (Name, Timeout) and no restart (Source, Workers).", activeRoute.routeName, listenAddrStr)
 	}
 }
 
 func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
+
 	baseInterval := AbsoluteDefaultCleanerBaseInterval
 	minInterval := AbsoluteDefaultCleanerMinInterval
 	maxInterval := AbsoluteDefaultCleanerMaxInterval
@@ -533,6 +550,7 @@ func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
 
 	if settings != nil {
 		configSource = "configuration file"
+
 		if settings.BaseInterval != "" {
 			d, err := time.ParseDuration(settings.BaseInterval)
 			if err == nil && d > 0 {
@@ -543,6 +561,7 @@ func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
 				log.Warnf("Cleaner base_interval '%s' (%v) is not positive. Using previous/default %v.", settings.BaseInterval, d, baseInterval)
 			}
 		}
+
 		if settings.MinInterval != "" {
 			d, err := time.ParseDuration(settings.MinInterval)
 			if err == nil && d > 0 {
@@ -553,6 +572,7 @@ func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
 				log.Warnf("Cleaner min_interval '%s' (%v) is not positive. Using previous/default %v.", settings.MinInterval, d, minInterval)
 			}
 		}
+
 		if settings.MaxInterval != "" {
 			d, err := time.ParseDuration(settings.MaxInterval)
 			if err == nil && d > 0 {
@@ -563,6 +583,7 @@ func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
 				log.Warnf("Cleaner max_interval '%s' (%v) is not positive. Using previous/default %v.", settings.MaxInterval, d, maxInterval)
 			}
 		}
+
 		if settings.IntervalDivisor != nil {
 			if *settings.IntervalDivisor > 0 {
 				divisor = *settings.IntervalDivisor
@@ -678,7 +699,10 @@ func (p *ProxyServer) Stop() {
 		for _, route := range routesToStop {
 			route.configLock.RLock()
 			rName := route.routeName
-			rAddr := route.listenAddr.String()
+			rAddr := "unknown"
+			if route.listenAddr != nil {
+				rAddr = route.listenAddr.String()
+			}
 			route.configLock.RUnlock()
 			log.Debugf("Triggering stop for route '%s' (%s)", rName, rAddr)
 

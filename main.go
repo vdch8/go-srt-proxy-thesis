@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,18 +33,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	globalCtx, globalCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer globalCancel()
+
 	cfg, err := LoadConfig(absConfigPath)
 	if err != nil {
-		println("FATAL: Failed to load initial config '"+absConfigPath+"':", err.Error())
+
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to load initial config '%s': %v\n", absConfigPath, err)
 		os.Exit(1)
 	}
 
-	SetupLogger(cfg.LogLevel)
+	SetupLogger(cfg.LogLevel, globalCtx)
 
 	log.Infof("Starting Proxy Server...")
 	log.Infof("Using configuration file: %s", absConfigPath)
 
-	globalCtx, globalCancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
 	proxyServer := NewProxyServer(globalCtx)
@@ -53,9 +57,10 @@ func main() {
 	log.Info("Proxy server started successfully")
 
 	reloadRequest := make(chan string, 1)
-	reloadTimer := time.NewTimer(0)
-	<-reloadTimer.C
-	reloadTimer.Stop()
+	reloadTimer := time.NewTimer(time.Second)
+	if !reloadTimer.Stop() {
+		<-reloadTimer.C
+	}
 	var lastModTime time.Time
 	configDir := filepath.Dir(absConfigPath)
 
@@ -74,6 +79,7 @@ func main() {
 
 		err = watcher.Add(configDir)
 		if err != nil {
+
 			if _, statErr := os.Stat(configDir); os.IsNotExist(statErr) {
 				log.Errorf("Config directory '%s' does not exist. Cannot watch for changes.", configDir)
 			} else {
@@ -97,24 +103,31 @@ func main() {
 					log.Warn("File watcher events channel closed.")
 					return
 				}
+
 				cleanEventPath := filepath.Clean(event.Name)
 				if cleanEventPath == absConfigPath {
+
 					if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Chmod) {
+
 						info, err := os.Stat(absConfigPath)
 						if err != nil {
+
 							log.Warnf("Config file '%s' change detected (event: %s), but stat failed: %v. Debouncing reload.", absConfigPath, event.Op, err)
 							reloadTimer.Reset(configReloadDebounce)
 							continue
 						}
 						currentModTime := info.ModTime()
-						if currentModTime.After(lastModTime) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Create) {
+
+						if currentModTime.After(lastModTime) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 							log.Infof("Config file '%s' change detected (event: %s, modtime: %s). Debouncing reload...", absConfigPath, event.Op, currentModTime.Format(modTimeFormat))
 							reloadTimer.Reset(configReloadDebounce)
+
 						} else if log.GetLevel() >= logrus.DebugLevel {
 							log.Debugf("Config file event %s ignored, modification time %s did not change.", event.Op, currentModTime.Format(modTimeFormat))
 						}
 					}
 				} else if cleanEventPath != filepath.Clean(configDir) && log.GetLevel() >= logrus.DebugLevel {
+
 					log.Debugf("Ignoring fsnotify event for unrelated file: %s (%s)", event.Name, event.Op)
 				}
 
@@ -132,20 +145,17 @@ func main() {
 		}
 	}()
 
-	sigterm := make(chan os.Signal, 1)
-	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
-
 	log.Info("Application started. Waiting for signals or config changes...")
 	keepRunning := true
 	for keepRunning {
 		select {
-		case <-sigterm:
-			log.Info("Shutdown signal received, initiating graceful shutdown...")
-			globalCancel()
+		case <-globalCtx.Done():
+			log.Info("Shutdown initiated by signal or context cancellation.")
 			keepRunning = false
 
 		case <-reloadTimer.C:
 			log.Info("Debounce timer fired. Queueing configuration reload.")
+
 			select {
 			case reloadRequest <- absConfigPath:
 				log.Debug("Reload request queued.")
@@ -158,6 +168,7 @@ func main() {
 			newCfg, err := LoadConfig(configToReload)
 			if err != nil {
 				log.Errorf("Failed to reload config from '%s': %v. Keeping old configuration.", configToReload, err)
+
 				info, statErr := os.Stat(configToReload)
 				if statErr == nil {
 					lastModTime = info.ModTime()
@@ -167,12 +178,16 @@ func main() {
 
 			if err := proxyServer.Reload(newCfg); err != nil {
 				log.Errorf("Failed to apply reloaded configuration: %v. Server might be in an inconsistent state.", err)
+
 			} else {
 				log.Info("Configuration reloaded and applied successfully.")
+
 				info, statErr := os.Stat(configToReload)
 				if statErr == nil {
 					lastModTime = info.ModTime()
 					log.Debugf("Updated lastModTime to %s", lastModTime.Format(modTimeFormat))
+				} else {
+					log.Warnf("Could not stat config file '%s' after successful reload: %v", configToReload, statErr)
 				}
 
 				currentLevel := log.GetLevel()
@@ -181,6 +196,7 @@ func main() {
 					if newLvl != currentLevel {
 						log.SetLevel(newLvl)
 						log.Infof("Log level updated to %s", newLvl.String())
+
 					} else {
 						log.Debugf("Log level '%s' in reloaded config is the same as current level.", newLvl.String())
 					}
@@ -189,12 +205,6 @@ func main() {
 						newCfg.LogLevel, currentLevel.String(), Lerr)
 				}
 			}
-
-		case <-globalCtx.Done():
-			if keepRunning {
-				log.Warn("Global context cancelled unexpectedly, initiating shutdown.")
-				keepRunning = false
-			}
 		}
 	}
 
@@ -202,6 +212,7 @@ func main() {
 	proxyServer.Stop()
 
 	log.Info("Waiting for background tasks (like file watcher) to finish...")
+
 	wg.Wait()
 
 	log.Info("Proxy Server stopped.")

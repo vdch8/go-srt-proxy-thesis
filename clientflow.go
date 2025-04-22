@@ -20,6 +20,7 @@ type ClientFlow struct {
 	routeName      string
 	routeTimeout   time.Duration
 	parentRoute    *ActiveRoute
+	stopOnce       sync.Once
 }
 
 func (cf *ClientFlow) reverseListenerLoop() {
@@ -30,8 +31,10 @@ func (cf *ClientFlow) reverseListenerLoop() {
 	sourceAddrStr := cf.sourceAddr.String()
 	localEphemAddrStr := "unknown"
 	outConn := cf.outConn
-	if outConn != nil && outConn.LocalAddr() != nil {
-		localEphemAddrStr = outConn.LocalAddr().String()
+	if outConn != nil {
+		if la := outConn.LocalAddr(); la != nil {
+			localEphemAddrStr = la.String()
+		}
 	}
 	parentListener := cf.parentListener
 
@@ -55,6 +58,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 		if currentOutConn == nil {
 			putPacketBuffer(pb)
 			log.Warnf("Route '%s': outConn became nil unexpectedly for reverse flow %s. Exiting loop.", routeName, clientAddrStr)
+			go cf.Stop()
 			return
 		}
 
@@ -111,7 +115,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 		logSRTPacket(cf.sourceAddr, pb.Data[:n], false, routeName, localEphemAddrStr)
 
 		if parentListener == nil {
-			log.Warnf("Route '%s': Parent listener is nil for flow %s. Cannot forward packet from source.", routeName, clientAddrStr)
+			log.Warnf("Route '%s': Parent listener is nil for flow %s. Cannot forward packet from source. Stopping flow.", routeName, clientAddrStr)
 			putPacketBuffer(pb)
 
 			go cf.Stop()
@@ -131,17 +135,15 @@ func (cf *ClientFlow) reverseListenerLoop() {
 		_, writeErr := parentListener.WriteToUDP(pb.Data[:n], cf.clientAddr)
 
 		if writeErr != nil {
+			putPacketBuffer(pb)
 
 			if errors.Is(writeErr, net.ErrClosed) {
 				log.Infof("Route '%s': Write to client %s failed: parent listener %s closed (route likely stopping). Exiting reverse flow.",
 					routeName, clientAddrStr, parentListenerLocalAddr)
-				putPacketBuffer(pb)
-
 				return
 			} else if errors.Is(writeErr, syscall.EPIPE) || errors.Is(writeErr, syscall.ECONNREFUSED) || errors.Is(writeErr, syscall.ENETUNREACH) || errors.Is(writeErr, syscall.EHOSTUNREACH) {
 				log.Warnf("Route '%s': Write to client %s failed: %v. Stopping flow and exiting reverse loop.",
 					routeName, clientAddrStr, writeErr)
-				putPacketBuffer(pb)
 				go cf.Stop()
 				return
 			} else {
@@ -152,47 +154,49 @@ func (cf *ClientFlow) reverseListenerLoop() {
 		} else {
 
 			logSRTPacket(cf.clientAddr, pb.Data[:n], true, routeName, parentListenerLocalAddr)
+			putPacketBuffer(pb)
 		}
-
-		putPacketBuffer(pb)
 	}
 }
 
 func (cf *ClientFlow) Stop() {
 
-	cf.flowCancel()
+	cf.stopOnce.Do(func() {
 
-	clientAddrStr := cf.clientAddr.String()
-	routeName := cf.routeName
+		clientAddrStr := cf.clientAddr.String()
+		routeName := cf.routeName
+		log.Debugf("Route '%s': Initiating stop sequence for flow %s.", routeName, clientAddrStr)
 
-	log.Debugf("Route '%s': Stopping flow %s.", routeName, clientAddrStr)
+		cf.flowCancel()
+		log.Debugf("Route '%s': Context cancelled for flow %s.", routeName, clientAddrStr)
 
-	outConn := cf.outConn
-	if outConn != nil {
-		localAddr := "unknown"
-		if outConn.LocalAddr() != nil {
-			localAddr = outConn.LocalAddr().String()
-		}
-		log.Debugf("Route '%s': Closing outConn %s for flow %s.", routeName, localAddr, clientAddrStr)
+		outConn := cf.outConn
+		if outConn != nil {
+			localAddr := "unknown"
+			if la := outConn.LocalAddr(); la != nil {
+				localAddr = la.String()
+			}
+			log.Debugf("Route '%s': Closing outConn %s for flow %s.", routeName, localAddr, clientAddrStr)
 
-		err := outConn.Close()
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Warnf("Route '%s': Error closing outConn %s for flow %s: %v", routeName, localAddr, clientAddrStr, err)
+			err := outConn.Close()
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Warnf("Route '%s': Error closing outConn %s for flow %s: %v", routeName, localAddr, clientAddrStr, err)
+			} else {
+				log.Debugf("Route '%s': Closed outConn %s for flow %s.", routeName, localAddr, clientAddrStr)
+			}
 		} else {
-			log.Debugf("Route '%s': Closed outConn %s for flow %s.", routeName, localAddr, clientAddrStr)
+			log.Debugf("Route '%s': outConn was already nil during stop sequence for flow %s.", routeName, clientAddrStr)
 		}
-	} else {
-		log.Debugf("Route '%s': outConn was already nil for flow %s.", routeName, clientAddrStr)
-	}
 
-	if cf.parentRoute != nil {
-		log.Debugf("Route '%s': Removing flow %s from parent route map.", routeName, clientAddrStr)
-		cf.parentRoute.clientFlows.Delete(clientAddrStr)
-	} else {
-		log.Warnf("Route '%s': Cannot remove flow %s from parent map, parentRoute is nil!", routeName, clientAddrStr)
-	}
+		if cf.parentRoute != nil {
+			log.Debugf("Route '%s': Removing flow %s from parent route map.", routeName, clientAddrStr)
+			cf.parentRoute.clientFlows.Delete(clientAddrStr)
+		} else {
+			log.Warnf("Route '%s': Cannot remove flow %s from parent map, parentRoute is nil during stop!", routeName, clientAddrStr)
+		}
 
-	log.Debugf("Route '%s': Waiting for reverse listener goroutine to stop for flow %s.", routeName, clientAddrStr)
-	cf.flowWg.Wait()
-	log.Debugf("Route '%s': Reverse listener stopped and flow %s fully stopped.", routeName, clientAddrStr)
+		log.Debugf("Route '%s': Waiting for reverse listener goroutine to stop for flow %s.", routeName, clientAddrStr)
+		cf.flowWg.Wait()
+		log.Debugf("Route '%s': Reverse listener stopped. Flow %s fully stopped.", routeName, clientAddrStr)
+	})
 }

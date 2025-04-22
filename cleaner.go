@@ -12,12 +12,10 @@ func (p *ProxyServer) flowCleanerLoop() {
 	defer p.cleanerWg.Done()
 
 	p.cleanerConfigLock.RLock()
-	currentInterval := p.cleanerBaseInterval
-	initialMin := p.cleanerMinInterval
-	initialMax := p.cleanerMaxInterval
+	currentInterval := p.cleanerInterval
 	p.cleanerConfigLock.RUnlock()
 
-	log.Infof("Starting global flow cleaner loop with initial interval %v (min: %v, max: %v, based on current settings)", currentInterval, initialMin, initialMax)
+	log.Infof("Starting global flow cleaner loop with interval %v (based on current settings)", currentInterval)
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
@@ -28,6 +26,17 @@ func (p *ProxyServer) flowCleanerLoop() {
 			return
 
 		case <-ticker.C:
+
+			p.cleanerConfigLock.RLock()
+			newInterval := p.cleanerInterval
+			p.cleanerConfigLock.RUnlock()
+
+			if newInterval != currentInterval {
+				log.Infof("Adjusting flow cleaner interval from %v to %v", currentInterval, newInterval)
+				ticker.Reset(newInterval)
+				currentInterval = newInterval
+			}
+
 			log.Debug("Flow cleaner ticker fired. Running cleanup cycle.")
 
 			removedCount := p.cleanupClientFlows()
@@ -38,63 +47,6 @@ func (p *ProxyServer) flowCleanerLoop() {
 				log.Debug("Flow cleanup cycle finished. No stopped flows found in map needing removal.")
 			}
 
-			p.cleanerConfigLock.RLock()
-			baseInterval := p.cleanerBaseInterval
-			minInterval := p.cleanerMinInterval
-			maxInterval := p.cleanerMaxInterval
-			intervalDivisor := p.cleanerIntervalDivisor
-			p.cleanerConfigLock.RUnlock()
-
-			minTimeout := DefaultFlowTimeout
-			foundActiveRouteWithTimeout := false
-
-			p.routesLock.RLock()
-			activeRouteList := make([]*ActiveRoute, 0, len(p.activeRoutes))
-			for _, r := range p.activeRoutes {
-				select {
-				case <-r.ctx.Done():
-				default:
-					activeRouteList = append(activeRouteList, r)
-				}
-			}
-			p.routesLock.RUnlock()
-
-			for _, route := range activeRouteList {
-				route.configLock.RLock()
-				currentRouteTimeout := route.flowTimeout
-				route.configLock.RUnlock()
-
-				if currentRouteTimeout > 0 {
-					if !foundActiveRouteWithTimeout || currentRouteTimeout < minTimeout {
-						minTimeout = currentRouteTimeout
-					}
-					foundActiveRouteWithTimeout = true
-				}
-			}
-
-			var newInterval time.Duration
-			if !foundActiveRouteWithTimeout {
-				newInterval = baseInterval
-				log.Debugf("No active connections with positive timeouts found, using configured base cleaner interval: %v", newInterval)
-			} else {
-
-				newInterval = minTimeout / time.Duration(intervalDivisor)
-
-				if newInterval < minInterval {
-					newInterval = minInterval
-				}
-				if newInterval > maxInterval {
-					newInterval = maxInterval
-				}
-				log.Debugf("Minimum active connections timeout is %v. Calculated cleaner interval: %v (using divisor %d, clamped to [%v, %v])",
-					minTimeout, newInterval, intervalDivisor, minInterval, maxInterval)
-			}
-
-			if newInterval != currentInterval {
-				log.Infof("Adjusting flow cleaner interval from %v to %v", currentInterval, newInterval)
-				ticker.Reset(newInterval)
-				currentInterval = newInterval
-			}
 		}
 	}
 }
@@ -140,19 +92,28 @@ func (p *ProxyServer) cleanupClientFlows() int64 {
 
 			ar.clientFlows.Range(func(key, value any) bool {
 				clientKey := key.(string)
-				flow := value.(*ClientFlow)
+				flow, ok := value.(*ClientFlow)
+				if !ok {
+					log.Warnf("Cleanup cycle: Found unexpected type in clientFlows map for key %s on route '%s'. Attempting removal.", clientKey, routeName)
+
+					if _, loaded := ar.clientFlows.LoadAndDelete(clientKey); loaded {
+						log.Debugf("Cleanup cycle: Removed unexpected entry for key %s in route '%s'.", clientKey, routeName)
+						totalRemovedCount.Add(1)
+					}
+					return true
+				}
 
 				select {
 				case <-flow.flowCtx.Done():
 					log.Warnf("Cleanup cycle: Found stopped flow (context done) for client %s on route '%s' still in map. Removing.", clientKey, routeName)
 
 					if _, loaded := ar.clientFlows.LoadAndDelete(clientKey); loaded {
-						log.Debugf("Cleanup cycle: Successfully removed potentially leaked flow for client %s in %s from map.", clientKey, routeName)
+						log.Debugf("Cleanup cycle: Successfully removed potentially leaked flow for client %s in route '%s' from map.", clientKey, routeName)
 						routeRemovedCount++
 						totalRemovedCount.Add(1)
 
 					} else {
-						log.Debugf("Cleanup cycle: Flow for client %s in %s was concurrently removed before cleanup could claim it.", clientKey, routeName)
+						log.Debugf("Cleanup cycle: Flow for client %s in route '%s' was concurrently removed before cleanup could claim it.", clientKey, routeName)
 					}
 					return true
 				default:

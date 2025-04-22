@@ -8,10 +8,7 @@ import (
 )
 
 type CleanerSettings struct {
-	BaseInterval    string `yaml:"base_interval,omitempty"`
-	MinInterval     string `yaml:"min_interval,omitempty"`
-	MaxInterval     string `yaml:"max_interval,omitempty"`
-	IntervalDivisor *int   `yaml:"interval_divisor,omitempty"`
+	Interval string `yaml:"interval,omitempty"`
 }
 
 type Config struct {

@@ -24,10 +24,7 @@ const (
 )
 
 const (
-	AbsoluteDefaultCleanerBaseInterval    = 5 * time.Second
-	AbsoluteDefaultCleanerMinInterval     = 1 * time.Second
-	AbsoluteDefaultCleanerMaxInterval     = 30 * time.Second
-	AbsoluteDefaultCleanerIntervalDivisor = 5
+	AbsoluteDefaultCleanerInterval = 60 * time.Second
 )
 
 type ProxyServer struct {
@@ -35,13 +32,9 @@ type ProxyServer struct {
 	routesLock   sync.RWMutex
 	globalCtx    context.Context
 
-	cleanerWg sync.WaitGroup
-
-	cleanerBaseInterval    time.Duration
-	cleanerMinInterval     time.Duration
-	cleanerMaxInterval     time.Duration
-	cleanerIntervalDivisor int
-	cleanerConfigLock      sync.RWMutex
+	cleanerWg         sync.WaitGroup
+	cleanerInterval   time.Duration
+	cleanerConfigLock sync.RWMutex
 
 	effectiveMinChanSize int
 	effectiveMaxChanSize int
@@ -59,25 +52,44 @@ type resolvedRoute struct {
 
 func resolveWorkerCount(routeCfg StreamRoute, defaults StreamRoute, routeName string) int {
 	workers := DefaultRouteWorkers
+	configSource := "absolute default"
+
+	if defaults.Workers != nil {
+		workers = *defaults.Workers
+		configSource = "'defaults' section"
+		log.Tracef("Route '%s': Using default worker count %d from %s", routeName, workers, configSource)
+	}
 
 	if routeCfg.Workers != nil {
 		workers = *routeCfg.Workers
-		log.Tracef("Route '%s': Using specific worker count: %d", routeName, workers)
-	} else if defaults.Workers != nil {
-		workers = *defaults.Workers
-		log.Tracef("Route '%s': Using default worker count from 'defaults' section: %d", routeName, workers)
-	} else {
-		log.Tracef("Route '%s': Using absolute default worker count: %d", routeName, DefaultRouteWorkers)
+		configSource = "route-specific setting"
+		log.Tracef("Route '%s': Using specific worker count %d from %s", routeName, workers, configSource)
 	}
 
+	appliedLimits := false
 	if workers < MinRouteWorkers {
-		log.Warnf("Requested worker count %d for route '%s' is below minimum %d, using minimum.", workers, routeName, MinRouteWorkers)
+		log.Warnf("Route '%s': Requested worker count %d (from %s) is below minimum %d, using minimum.",
+			routeName, workers, configSource, MinRouteWorkers)
 		workers = MinRouteWorkers
+		appliedLimits = true
 	}
 	if workers > MaxRouteWorkers {
-		log.Warnf("Requested worker count %d for route '%s' exceeds maximum %d, using maximum.", workers, routeName, MaxRouteWorkers)
+		log.Warnf("Route '%s': Requested worker count %d (from %s) exceeds maximum %d, using maximum.",
+			routeName, workers, configSource, MaxRouteWorkers)
 		workers = MaxRouteWorkers
+		appliedLimits = true
 	}
+
+	if !appliedLimits && configSource != "absolute default" {
+		log.Debugf("Route '%s': Final worker count set to %d (from %s, within limits [%d, %d])",
+			routeName, workers, configSource, MinRouteWorkers, MaxRouteWorkers)
+	} else if configSource == "absolute default" {
+		log.Debugf("Route '%s': Using absolute default worker count: %d", routeName, workers)
+	} else if appliedLimits {
+		log.Debugf("Route '%s': Final worker count clamped to %d (within limits [%d, %d])",
+			routeName, workers, MinRouteWorkers, MaxRouteWorkers)
+	}
+
 	return workers
 }
 
@@ -132,14 +144,11 @@ func (p *ProxyServer) resolveChannelSize(routeCfg StreamRoute, defaults StreamRo
 func NewProxyServer(parentCtx context.Context) *ProxyServer {
 	log.Debug("Creating new Proxy Server")
 	p := &ProxyServer{
-		activeRoutes:           make(map[string]*ActiveRoute),
-		globalCtx:              parentCtx,
-		cleanerBaseInterval:    AbsoluteDefaultCleanerBaseInterval,
-		cleanerMinInterval:     AbsoluteDefaultCleanerMinInterval,
-		cleanerMaxInterval:     AbsoluteDefaultCleanerMaxInterval,
-		cleanerIntervalDivisor: AbsoluteDefaultCleanerIntervalDivisor,
-		effectiveMinChanSize:   AbsoluteDefaultMinPacketChanSize,
-		effectiveMaxChanSize:   AbsoluteDefaultMaxPacketChanSize,
+		activeRoutes:         make(map[string]*ActiveRoute),
+		globalCtx:            parentCtx,
+		cleanerInterval:      AbsoluteDefaultCleanerInterval,
+		effectiveMinChanSize: AbsoluteDefaultMinPacketChanSize,
+		effectiveMaxChanSize: AbsoluteDefaultMaxPacketChanSize,
 	}
 	return p
 }
@@ -324,11 +333,11 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 	hasInvalidRoute := false
 	uniqueListenAddrs := make(map[string]string)
 
-	for _, routeCfg := range cfg.Streams {
+	for i, routeCfg := range cfg.Streams {
 
 		if routeCfg.Name == "" || routeCfg.ListenAddress == "" || routeCfg.SourceAddress == "" {
-			log.Errorf("Config Validation: Skipping route due to empty required fields: Name='%s', Listen='%s', Source='%s'",
-				routeCfg.Name, routeCfg.ListenAddress, routeCfg.SourceAddress)
+			log.Errorf("Config Validation: Skipping route #%d due to empty required fields: Name='%s', Listen='%s', Source='%s'",
+				i+1, routeCfg.Name, routeCfg.ListenAddress, routeCfg.SourceAddress)
 			hasInvalidRoute = true
 			continue
 		}
@@ -378,13 +387,11 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 }
 
 func (p *ProxyServer) stopRemovedRoutesLocked(newRouteConfigs map[string]resolvedRoute) bool {
-
+	routesToStop := []*ActiveRoute{}
 	currentRouteAddrs := make([]string, 0, len(p.activeRoutes))
 	for listenAddrStr := range p.activeRoutes {
 		currentRouteAddrs = append(currentRouteAddrs, listenAddrStr)
 	}
-
-	routesToStop := []*ActiveRoute{}
 
 	for _, listenAddrStr := range currentRouteAddrs {
 		if _, existsInNew := newRouteConfigs[listenAddrStr]; !existsInNew {
@@ -397,6 +404,8 @@ func (p *ProxyServer) stopRemovedRoutesLocked(newRouteConfigs map[string]resolve
 				routesToStop = append(routesToStop, activeRoute)
 
 				delete(p.activeRoutes, listenAddrStr)
+			} else {
+				log.Warnf("Reload: Route %s was expected in activeRoutes but not found during removal check.", listenAddrStr)
 			}
 		}
 	}
@@ -541,89 +550,41 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 }
 
 func (p *ProxyServer) updateCleanerSettings(settings *CleanerSettings) {
+	newInterval := AbsoluteDefaultCleanerInterval
+	configSource := "absolute default"
 
-	baseInterval := AbsoluteDefaultCleanerBaseInterval
-	minInterval := AbsoluteDefaultCleanerMinInterval
-	maxInterval := AbsoluteDefaultCleanerMaxInterval
-	divisor := AbsoluteDefaultCleanerIntervalDivisor
-	configSource := "absolute defaults"
-
-	if settings != nil {
-		configSource = "configuration file"
-
-		if settings.BaseInterval != "" {
-			d, err := time.ParseDuration(settings.BaseInterval)
-			if err == nil && d > 0 {
-				baseInterval = d
-			} else if err != nil {
-				log.Warnf("Invalid cleaner base_interval '%s': %v. Using previous/default %v.", settings.BaseInterval, err, baseInterval)
+	if settings != nil && settings.Interval != "" {
+		parsedInterval, err := time.ParseDuration(settings.Interval)
+		if err == nil {
+			if parsedInterval > 0 {
+				newInterval = parsedInterval
+				configSource = "configuration file"
 			} else {
-				log.Warnf("Cleaner base_interval '%s' (%v) is not positive. Using previous/default %v.", settings.BaseInterval, d, baseInterval)
+				log.Warnf("Invalid cleaner interval '%s' (%v) in config is not positive. Using previous/default value %v.",
+					settings.Interval, parsedInterval, p.cleanerInterval)
+				newInterval = p.cleanerInterval
+				configSource = "previous value due to invalid config"
 			}
+		} else {
+			log.Warnf("Invalid cleaner interval duration format '%s': %v. Using previous/default value %v.",
+				settings.Interval, err, p.cleanerInterval)
+			newInterval = p.cleanerInterval
+			configSource = "previous value due to parse error"
 		}
-
-		if settings.MinInterval != "" {
-			d, err := time.ParseDuration(settings.MinInterval)
-			if err == nil && d > 0 {
-				minInterval = d
-			} else if err != nil {
-				log.Warnf("Invalid cleaner min_interval '%s': %v. Using previous/default %v.", settings.MinInterval, err, minInterval)
-			} else {
-				log.Warnf("Cleaner min_interval '%s' (%v) is not positive. Using previous/default %v.", settings.MinInterval, d, minInterval)
-			}
-		}
-
-		if settings.MaxInterval != "" {
-			d, err := time.ParseDuration(settings.MaxInterval)
-			if err == nil && d > 0 {
-				maxInterval = d
-			} else if err != nil {
-				log.Warnf("Invalid cleaner max_interval '%s': %v. Using previous/default %v.", settings.MaxInterval, err, maxInterval)
-			} else {
-				log.Warnf("Cleaner max_interval '%s' (%v) is not positive. Using previous/default %v.", settings.MaxInterval, d, maxInterval)
-			}
-		}
-
-		if settings.IntervalDivisor != nil {
-			if *settings.IntervalDivisor > 0 {
-				divisor = *settings.IntervalDivisor
-			} else {
-				log.Warnf("cleaner interval_divisor %d is not positive. Using previous/default %d.", *settings.IntervalDivisor, divisor)
-			}
-		}
-	}
-
-	if minInterval > maxInterval {
-		log.Warnf("cleaner min_interval (%v from %s) cannot be greater than max_interval (%v from %s). Clamping max_interval = min_interval.", minInterval, configSource, maxInterval, configSource)
-		maxInterval = minInterval
-	}
-	if baseInterval < minInterval {
-		log.Warnf("cleaner base_interval (%v from %s) is less than min_interval (%v). Clamping base_interval = min_interval.", baseInterval, configSource, minInterval)
-		baseInterval = minInterval
-	}
-	if baseInterval > maxInterval {
-		log.Warnf("cleaner base_interval (%v from %s) is greater than max_interval (%v). Clamping base_interval = max_interval.", baseInterval, configSource, maxInterval)
-		baseInterval = maxInterval
 	}
 
 	p.cleanerConfigLock.Lock()
-	updated := p.cleanerBaseInterval != baseInterval ||
-		p.cleanerMinInterval != minInterval ||
-		p.cleanerMaxInterval != maxInterval ||
-		p.cleanerIntervalDivisor != divisor
-
-	p.cleanerBaseInterval = baseInterval
-	p.cleanerMinInterval = minInterval
-	p.cleanerMaxInterval = maxInterval
-	p.cleanerIntervalDivisor = divisor
+	updated := p.cleanerInterval != newInterval
+	oldInterval := p.cleanerInterval
+	p.cleanerInterval = newInterval
 	p.cleanerConfigLock.Unlock()
 
 	if updated {
-		log.Infof("Cleaner settings updated (source: %s): BaseInterval=%v, MinInterval=%v, MaxInterval=%v, IntervalDivisor=%d",
-			configSource, baseInterval, minInterval, maxInterval, divisor)
+		log.Infof("Cleaner interval updated (source: %s): %v -> %v",
+			configSource, oldInterval, newInterval)
 	} else {
-		log.Debugf("Cleaner settings remain unchanged (source: %s): BaseInterval=%v, MinInterval=%v, MaxInterval=%v, IntervalDivisor=%d",
-			configSource, baseInterval, minInterval, maxInterval, divisor)
+		log.Debugf("Cleaner interval remains unchanged: %v (source: %s)",
+			newInterval, configSource)
 	}
 }
 

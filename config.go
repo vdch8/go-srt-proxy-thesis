@@ -30,7 +30,6 @@ type CleanerSettings struct {
 
 type Config struct {
 	LogSettings       *LogSettings     `yaml:"log_settings,omitempty"`
-	FlowTimeout       string           `yaml:"flow_timeout,omitempty"`
 	Defaults          StreamRoute      `yaml:"defaults,omitempty"`
 	Streams           []StreamRoute    `yaml:"streams"`
 	Cleaner           *CleanerSettings `yaml:"cleaner_settings,omitempty"`
@@ -69,7 +68,8 @@ func LoadConfig(path string) (*Config, error) {
 			SRTLogBufSize:   intPtr(defaultSRTLogChannelCap),
 			TimestampFormat: defaultLogTimestampFormat,
 		},
-		Cleaner: &CleanerSettings{},
+		Defaults: StreamRoute{},
+		Cleaner:  &CleanerSettings{},
 	}
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {

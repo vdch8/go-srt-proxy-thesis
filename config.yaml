@@ -31,11 +31,9 @@ log_settings:
     # Размер канала для асинхронной обработки логов SRT-пакетов
     # По умолчанию: 8192
     srt_log_buffer_size: 16384
-    # Формат временной метки для логов
+    # Формат временной метки для логов (использует формат Go time)
     # По умолчанию: "2006-01-02 15:04:05.000"
     timestamp_format: "2006-01-02 15:04:05.000"
-
-
 
 # --- Глобальные настройки по умолчанию ---
 
@@ -44,38 +42,28 @@ log_settings:
 # Если не указан, используется значение по умолчанию из кода (2048)
 udp_read_buffer_size: 2048
 
-# Таймаут неактивности потока по умолчанию (если не переопределен в defaults или stream)
-# Используйте формат Go Duration ("60s", "5m", "1h")
-# Если не указан, используется абсолютный дефолт (60s)
-flow_timeout: "10s"
-
 # Минимальный размер канала пакетов для маршрутов
 # Если chan_size маршрута меньше этого значения, будет использовано это значение
 # По умолчанию в коде 64
 min_channel_size: 128
-min_client_chan_size: 32
-min_writeback_chan_size: 64
 
 # Максимальный размер канала пакетов для маршрутов
 # Если chan_size маршрута больше этого значения, будет использовано это значение
 # По умолчанию в коде 8192
 max_channel_size: 8192
-max_client_chan_size: 2048
-max_writeback_chan_size: 8192
 
 # --- Настройки Cleaner'а ---
 cleaner_settings:
   # Интервал проверки, используется если нет активных потоков с таймаутом
-
   interval: "60s"
-
-
 
 # --- Значения по умолчанию для секции streams ---
 # Эти значения используются для маршрутов, если они не указаны явно в самом маршруте
 defaults:
-  # Таймаут неактивности для потоков (переопределяет глобальный flow_timeout)
-  flow_timeout: "60s"
+  # Таймаут неактивности потока по умолчанию
+  # Используйте формат Go Duration ("60s", "5m", "1h")
+  # Если не указан, используется абсолютный дефолт (10s)
+  flow_timeout: "5s"
 
   # Количество горутин-воркеров для обработки пакетов маршрута
   # Должно быть в диапазоне [1, 128]
@@ -85,32 +73,25 @@ defaults:
   # Будет ограничен глобальными min_channel_size и max_channel_size
   chan_size: 1024
 
-  client_chan_size: 256
-
-  writeback_chan_size: 1024
-
 
 # --- Список правил маршрутизации потоков ---
 streams:
-#  - name: "High_Performance_Stream" # Имя маршрута
-#    listen_address: ":9001" # Локальный адрес:порт для приема от клиента
-#    source_address: "10.0.2.200:9002" # Адрес:порт источника данных
-#    flow_timeout: "30s" # Переопределяем flow_timeout из defaults
-#    workers: 12 # Переопределяем workers из defaults
-#    chan_size: 2048 # Переопределяем chan_size из defaults
-#    client_chan_size: 512              # Больший канал Worker -> Client Flow
-#    writeback_chan_size: 2048          # Больший канал Flow Reader -> Main Writer
+  - name: "Stream-A" # Имя маршрута
+    listen_address: ":9001" # Локальный адрес:порт для приема от клиента
+    source_address: "10.0.2.200:9002" # Адрес:порт источника данных
+    flow_timeout: "10s" # Переопределяем flow_timeout из defaults
+    workers: 12 # Переопределяем workers из defaults
+    chan_size: 2048 # Переопределяем chan_size из defaults
 
-#  - name: "Stream-B"
-#    listen_address: ":9003"
-#    source_address: "192.168.60.156:9004"
-#    # Используем workers и chan_size из defaults
-#    flow_timeout: "45s"
+  - name: "Stream-B"
+    listen_address: ":9003"
+    source_address: "192.168.60.156:9004"
+    # Используем workers и chan_size из defaults
+    flow_timeout: "3s"
 
   - name: "Stream-C"
-    listen_address: "192.168.60.129:9005"
-    source_address: "192.168.60.144:9005"
-    workers: 12
+    listen_address: ":9005"
+    source_address: "192.168.60.156:9006"
+    workers: 8
     chan_size: 2048
-    client_chan_size: 512
-    writeback_chan_size: 2048
+    # Используем flow_timeout из defaults

@@ -333,6 +333,8 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 	hasInvalidRoute := false
 	uniqueListenAddrs := make(map[string]string)
 
+	defaultsConfig := cfg.Defaults
+
 	for i, routeCfg := range cfg.Streams {
 
 		if routeCfg.Name == "" || routeCfg.ListenAddress == "" || routeCfg.SourceAddress == "" {
@@ -364,9 +366,9 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 			continue
 		}
 
-		timeout := parseTimeout(routeCfg.FlowTimeout, cfg.FlowTimeout)
-		workers := resolveWorkerCount(routeCfg, cfg.Defaults, routeCfg.Name)
-		chanSize := p.resolveChannelSize(routeCfg, cfg.Defaults, routeCfg.Name)
+		timeout := parseTimeout(routeCfg.FlowTimeout, defaultsConfig.FlowTimeout)
+		workers := resolveWorkerCount(routeCfg, defaultsConfig, routeCfg.Name)
+		chanSize := p.resolveChannelSize(routeCfg, defaultsConfig, routeCfg.Name)
 
 		resRoute := resolvedRoute{
 			routeCfg:   routeCfg,

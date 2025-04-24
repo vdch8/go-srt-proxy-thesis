@@ -104,7 +104,6 @@ func (ar *ActiveRoute) clientListenerLoop() {
 
 		select {
 		case ar.packetChan <- pb:
-			log.Tracef("Route '%s': Packet from %s (%d bytes) queued for processing.", initialRouteName, remoteAddr.String(), n)
 
 		case <-ar.ctx.Done():
 
@@ -152,15 +151,9 @@ func (ar *ActiveRoute) packetWorker(workerID int) {
 				continue
 			}
 
-			ar.configLock.RLock()
-			currentRouteName := ar.routeName
-			ar.configLock.RUnlock()
-			log.Tracef("Route '%s': Worker %d picked up packet from %s (%d bytes).", currentRouteName, workerID, pb.RemoteAddr.String(), pb.N)
-
 			ar.handleClientPacket(pb)
 
 			putPacketBuffer(pb)
-			log.Tracef("Route '%s': Worker %d finished processing packet from %s, buffer returned.", currentRouteName, workerID, pb.RemoteAddr.String())
 
 		case <-ar.ctx.Done():
 			log.Debugf("Route '%s': Worker %d detected context cancellation. Exiting.", routeName, workerID)

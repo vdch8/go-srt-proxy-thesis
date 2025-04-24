@@ -388,6 +388,9 @@ func processSRTLogMessage(msg SRTLogMsg) {
 			logMsg = fmt.Sprintf("%s %s SRT Control KEEPALIVE %s %s via %s",
 				logPrefix, direction, targetRelation, msg.RemoteAddr.String(), msg.LocalAddrStr)
 			log.Trace(logMsg)
+			if isTraceLevel && techDetails != "" {
+				log.Tracef("%s %s", logMsg, techDetails)
+			}
 
 		case packet.CTRLTYPE_ACK:
 			var ackCIF packet.CIFACK
@@ -403,7 +406,7 @@ func processSRTLogMessage(msg SRTLogMsg) {
 
 			logMsg = fmt.Sprintf("%s %s SRT Control %s %s %s via %s",
 				logPrefix, direction, ackTypeStr, targetRelation, msg.RemoteAddr.String(), msg.LocalAddrStr)
-			log.Debug(logMsg)
+			log.Trace(logMsg)
 			if isTraceLevel {
 				log.Tracef("%s %s", logMsg, techDetails)
 			}
@@ -414,7 +417,7 @@ func processSRTLogMessage(msg SRTLogMsg) {
 
 			logMsg = fmt.Sprintf("%s %s SRT Control NAK %s %s via %s",
 				logPrefix, direction, targetRelation, msg.RemoteAddr.String(), msg.LocalAddrStr)
-			log.Debug(logMsg)
+			log.Trace(logMsg)
 
 			if cifErr == nil {
 
@@ -455,7 +458,7 @@ func processSRTLogMessage(msg SRTLogMsg) {
 				logMsg += fmt.Sprintf("/SubType:%s", hdr.SubType)
 			}
 			logMsg += fmt.Sprintf(") %s %s via %s", targetRelation, msg.RemoteAddr.String(), msg.LocalAddrStr)
-			log.Debug(logMsg)
+			log.Trace(logMsg)
 			if isTraceLevel {
 				log.Tracef("%s %s", logMsg, techDetails)
 			}

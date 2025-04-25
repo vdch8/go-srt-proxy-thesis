@@ -7,6 +7,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/datarhei/gosrt/packet"
 )
 
 type ActiveRoute struct {
@@ -191,6 +193,34 @@ func (ar *ActiveRoute) handleClientPacket(pb *packetBuffer) {
 		ar.processPacketForExistingFlow(flow, pb, routeName)
 	} else {
 
+		if pb.N < srtHeaderSize {
+			log.Warnf("Route '%s': Received packet from new client %s (size %d) too small for SRT header. Dropping.",
+				routeName, clientAddrStr, pb.N)
+			return
+		}
+
+		srtPkt := packet.NewPacket(nil)
+
+		defer srtPkt.Decommission()
+
+		err := srtPkt.Unmarshal(pb.Data[:pb.N])
+		if err != nil {
+			log.Warnf("Route '%s': Failed to unmarshal SRT header from new client %s: %v. Dropping packet.",
+				routeName, clientAddrStr, err)
+			return
+		}
+
+		hdr := srtPkt.Header()
+
+		if !hdr.IsControlPacket || hdr.ControlType != packet.CTRLTYPE_HANDSHAKE {
+			log.Warnf("Route '%s': First packet from new client %s is not an SRT Handshake (Control: %t, Type: %s). Dropping packet.",
+				routeName, clientAddrStr, hdr.IsControlPacket, hdr.ControlType.String())
+			return
+		}
+
+		log.Debugf("Route '%s': First packet from new client %s validated as SRT Handshake. Proceeding to create flow.",
+			routeName, clientAddrStr)
+
 		ar.createNewFlowAndProcessPacket(pb, routeName, targetSource, flowTimeout, parentListener)
 	}
 }
@@ -308,7 +338,10 @@ func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName
 			routeName, clientAddrStr, ephemeralAddrStr)
 
 		flowCancel()
-		outConn.Close()
+		closeErr := outConn.Close()
+		if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			log.Warnf("Route '%s': Error closing redundant outConn %s during race condition handling: %v", routeName, ephemeralAddrStr, closeErr)
+		}
 
 		ar.processPacketForExistingFlow(existingFlow, pb, routeName)
 		return

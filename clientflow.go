@@ -31,12 +31,13 @@ func (cf *ClientFlow) reverseListenerLoop() {
 	sourceAddrStr := cf.sourceAddr.String()
 	localEphemAddrStr := "unknown"
 	outConn := cf.outConn
+	parentListener := cf.parentListener
+
 	if outConn != nil {
 		if la := outConn.LocalAddr(); la != nil {
 			localEphemAddrStr = la.String()
 		}
 	}
-	parentListener := cf.parentListener
 
 	log.Debugf("Route '%s': Starting reverse listener loop for flow %s (%s <- %s), timeout: %v",
 		routeName, clientAddrStr, localEphemAddrStr, sourceAddrStr, cf.routeTimeout)
@@ -67,11 +68,20 @@ func (cf *ClientFlow) reverseListenerLoop() {
 			deadline = time.Now().Add(cf.routeTimeout)
 			err := currentOutConn.SetReadDeadline(deadline)
 			if err != nil {
-
+				if errors.Is(err, net.ErrClosed) {
+					log.Debugf("Route '%s': Failed to set read deadline on outConn for flow %s: connection already closed. Exiting loop.", routeName, clientAddrStr)
+					putPacketBuffer(pb)
+					return
+				}
 				log.Errorf("Route '%s': Failed to set read deadline on outConn for flow %s: %v. Stopping flow.", routeName, clientAddrStr, err)
 				putPacketBuffer(pb)
 				go cf.Stop()
 				return
+			}
+		} else {
+			err := currentOutConn.SetReadDeadline(time.Time{})
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Warnf("Route '%s': Failed to remove read deadline on outConn for flow %s: %v.", routeName, clientAddrStr, err)
 			}
 		}
 
@@ -149,7 +159,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 			} else {
 				log.Errorf("Route '%s': Error writing to client %s via %s (from source %s): %v",
 					routeName, clientAddrStr, parentListenerLocalAddr, sourceAddrStr, writeErr)
-
+				return
 			}
 		} else {
 

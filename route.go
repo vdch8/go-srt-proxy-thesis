@@ -27,6 +27,7 @@ type ActiveRoute struct {
 	configLock sync.RWMutex
 
 	packetChan chan *packetBuffer
+	startupWg  sync.WaitGroup
 	workerWg   sync.WaitGroup
 	numWorkers int
 }
@@ -42,10 +43,12 @@ func (ar *ActiveRoute) startProcessing() {
 	log.Debugf("Route '%s': Client listener loop goroutine started for %s", rName, addr)
 
 	log.Debugf("Route '%s': Starting %d packet worker goroutines for %s", rName, workers, addr)
+	ar.startupWg.Add(workers)
 	ar.workerWg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go ar.packetWorker(i)
+		go ar.packetWorker(i, &ar.startupWg)
 	}
+	ar.startupWg.Wait()
 	log.Debugf("Route '%s': All %d packet workers started", rName, workers)
 }
 
@@ -122,7 +125,7 @@ func (ar *ActiveRoute) clientListenerLoop() {
 	}
 }
 
-func (ar *ActiveRoute) packetWorker(workerID int) {
+func (ar *ActiveRoute) packetWorker(workerID int, startupWg *sync.WaitGroup) {
 	defer ar.workerWg.Done()
 
 	ar.configLock.RLock()
@@ -130,6 +133,8 @@ func (ar *ActiveRoute) packetWorker(workerID int) {
 	ar.configLock.RUnlock()
 
 	log.Debugf("Route '%s': Worker %d started.", routeName, workerID)
+	startupWg.Done()
+
 	defer log.Debugf("Route '%s': Worker %d stopped.", routeName, workerID)
 
 	for {

@@ -26,10 +26,14 @@ type ActiveRoute struct {
 
 	configLock sync.RWMutex
 
-	packetChan chan *packetBuffer
-	startupWg  sync.WaitGroup
-	workerWg   sync.WaitGroup
-	numWorkers int
+	packetChan        chan *packetBuffer
+	listenReadBuffer  int
+	listenWriteBuffer int
+	clientReadBuffer  int
+	clientWriteBuffer int
+	startupWg         sync.WaitGroup
+	workerWg          sync.WaitGroup
+	numWorkers        int
 }
 
 func (ar *ActiveRoute) startProcessing() {
@@ -186,6 +190,8 @@ func (ar *ActiveRoute) handleClientPacket(pb *packetBuffer) {
 	if parentListener != nil && parentListener.LocalAddr() != nil {
 		listenerAddrStr = parentListener.LocalAddr().String()
 	}
+	clientReadBuf := ar.clientReadBuffer
+	clientWriteBuf := ar.clientWriteBuffer
 	ar.configLock.RUnlock()
 
 	logSRTPacket(clientAddr, pb.Data[:pb.N], false, routeName, listenerAddrStr)
@@ -226,7 +232,7 @@ func (ar *ActiveRoute) handleClientPacket(pb *packetBuffer) {
 		log.Debugf("Route '%s': First packet from new client %s validated as SRT Handshake. Proceeding to create flow.",
 			routeName, clientAddrStr)
 
-		ar.createNewFlowAndProcessPacket(pb, routeName, targetSource, flowTimeout, parentListener)
+		ar.createNewFlowAndProcessPacket(pb, routeName, targetSource, flowTimeout, parentListener, clientReadBuf, clientWriteBuf)
 	}
 }
 
@@ -292,7 +298,7 @@ func (ar *ActiveRoute) processPacketForExistingFlow(flow *ClientFlow, pb *packet
 	}
 }
 
-func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName string, targetSource *net.UDPAddr, flowTimeout time.Duration, parentListener *net.UDPConn) {
+func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName string, targetSource *net.UDPAddr, flowTimeout time.Duration, parentListener *net.UDPConn, clientReadBuf, clientWriteBuf int) {
 	clientAddr := pb.RemoteAddr
 	clientAddrStr := clientAddr.String()
 	targetSourceStr := targetSource.String()
@@ -314,6 +320,34 @@ func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName
 	ephemeralAddrStr := ephemeralAddr.String()
 	log.Debugf("Route '%s': Created outgoing UDP connection %s -> %s for client %s",
 		routeName, ephemeralAddrStr, targetSourceStr, clientAddrStr)
+
+	if clientReadBuf > 0 {
+		err := outConn.SetReadBuffer(clientReadBuf)
+		if err != nil {
+			log.Warnf("Route '%s': Failed to set client read buffer to %d bytes for flow %s (%s -> %s): %v",
+				routeName, clientReadBuf, clientAddrStr, ephemeralAddrStr, targetSourceStr, err)
+		} else {
+			log.Debugf("Route '%s': Successfully requested client read buffer size %d bytes for flow %s (%s -> %s)",
+				routeName, clientReadBuf, clientAddrStr, ephemeralAddrStr, targetSourceStr)
+		}
+	} else {
+		log.Debugf("Route '%s': Using OS default client read buffer for flow %s (%s -> %s)",
+			routeName, clientAddrStr, ephemeralAddrStr, targetSourceStr)
+	}
+
+	if clientWriteBuf > 0 {
+		err := outConn.SetWriteBuffer(clientWriteBuf)
+		if err != nil {
+			log.Warnf("Route '%s': Failed to set client write buffer to %d bytes for flow %s (%s -> %s): %v",
+				routeName, clientWriteBuf, clientAddrStr, ephemeralAddrStr, targetSourceStr, err)
+		} else {
+			log.Debugf("Route '%s': Successfully requested client write buffer size %d bytes for flow %s (%s -> %s)",
+				routeName, clientWriteBuf, clientAddrStr, ephemeralAddrStr, targetSourceStr)
+		}
+	} else {
+		log.Debugf("Route '%s': Using OS default client write buffer for flow %s (%s -> %s)",
+			routeName, clientAddrStr, ephemeralAddrStr, targetSourceStr)
+	}
 
 	flowCtx, flowCancel := context.WithCancel(ar.ctx)
 

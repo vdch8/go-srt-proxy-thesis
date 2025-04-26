@@ -73,6 +73,14 @@ defaults:
   # Будет ограничен глобальными min_channel_size и max_channel_size
   chan_size: 1024
 
+  # Буферы основного сокета маршрута (SO_RCVBUF, SO_SNDBUF)
+  listen_read_buffer: 16777216
+  listen_write_buffer: 16777216
+
+  # Буферы сокетов для исходящих соединений к источнику (SO_RCVBUF, SO_SNDBUF)
+  client_read_buffer: 16777216
+  client_write_buffer: 16777216
+
 
 # --- Список правил маршрутизации потоков ---
 streams:
@@ -82,11 +90,15 @@ streams:
     flow_timeout: "10s" # Переопределяем flow_timeout из defaults
     workers: 12 # Переопределяем workers из defaults
     chan_size: 2048 # Переопределяем chan_size из defaults
+    listen_read_buffer: 4194304     # 4 MiB
+    listen_write_buffer: 4194304    # 4 MiB
+    client_read_buffer: 262144      # 256 KiB
+    client_write_buffer: 262144     # 256 KiB
 
   - name: "Stream-B"
     listen_address: ":9003"
     source_address: "192.168.60.156:9004"
-    # Используем workers и chan_size из defaults
+    # Используем workers, buffers и chan_size из defaults
     flow_timeout: "3s"
 
   - name: "Stream-C"
@@ -94,4 +106,6 @@ streams:
     source_address: "192.168.60.156:9006"
     workers: 8
     chan_size: 2048
-    # Используем flow_timeout из defaults
+    client_read_buffer: 262144      # 256 KiB
+    client_write_buffer: 262144     # 256 KiB
+    # Используем flow_timeout и буферы сокета маршрута из defaults

@@ -39,12 +39,16 @@ type Config struct {
 }
 
 type StreamRoute struct {
-	Name          string `yaml:"name"`
-	ListenAddress string `yaml:"listen_address"`
-	SourceAddress string `yaml:"source_address"`
-	FlowTimeout   string `yaml:"flow_timeout,omitempty"`
-	Workers       *int   `yaml:"workers,omitempty"`
-	ChanSize      *int   `yaml:"chan_size,omitempty"`
+	Name              string `yaml:"name"`
+	ListenAddress     string `yaml:"listen_address"`
+	SourceAddress     string `yaml:"source_address"`
+	FlowTimeout       string `yaml:"flow_timeout,omitempty"`
+	Workers           *int   `yaml:"workers,omitempty"`
+	ChanSize          *int   `yaml:"chan_size,omitempty"`
+	ListenReadBuffer  *int   `yaml:"listen_read_buffer,omitempty"`
+	ListenWriteBuffer *int   `yaml:"listen_write_buffer,omitempty"`
+	ClientReadBuffer  *int   `yaml:"client_read_buffer,omitempty"`
+	ClientWriteBuffer *int   `yaml:"client_write_buffer,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -145,7 +149,24 @@ func LoadConfig(path string) (*Config, error) {
 		listenAddrs[stream.ListenAddress] = stream.Name
 	}
 
+	checkBufferConfig("defaults", "listen_read_buffer", cfg.Defaults.ListenReadBuffer)
+	checkBufferConfig("defaults", "listen_write_buffer", cfg.Defaults.ListenWriteBuffer)
+	checkBufferConfig("defaults", "client_read_buffer", cfg.Defaults.ClientReadBuffer)
+	checkBufferConfig("defaults", "client_write_buffer", cfg.Defaults.ClientWriteBuffer)
+	for i, stream := range cfg.Streams {
+		checkBufferConfig(fmt.Sprintf("stream %s (index %d)", stream.Name, i+1), "listen_read_buffer", stream.ListenReadBuffer)
+		checkBufferConfig(fmt.Sprintf("stream %s (index %d)", stream.Name, i+1), "listen_write_buffer", stream.ListenWriteBuffer)
+		checkBufferConfig(fmt.Sprintf("stream %s (index %d)", stream.Name, i+1), "client_read_buffer", stream.ClientReadBuffer)
+		checkBufferConfig(fmt.Sprintf("stream %s (index %d)", stream.Name, i+1), "client_write_buffer", stream.ClientWriteBuffer)
+	}
+
 	return &cfg, nil
+}
+
+func checkBufferConfig(source, fieldName string, value *int) {
+	if value != nil && *value <= 0 {
+		fmt.Fprintf(os.Stderr, "WARN: Config value %s for %s is %d (not positive). OS default or absolute default will be used during resolution.\n", fieldName, source, *value)
+	}
 }
 
 func intPtr(i int) *int {

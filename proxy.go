@@ -15,12 +15,14 @@ const (
 )
 
 const (
-	DefaultRouteWorkers              = 1
-	MinRouteWorkers                  = 1
-	MaxRouteWorkers                  = 128
-	AbsoluteDefaultPacketChanSize    = 1024
-	AbsoluteDefaultMinPacketChanSize = 64
-	AbsoluteDefaultMaxPacketChanSize = 8192
+	DefaultRouteWorkers                   = 1
+	MinRouteWorkers                       = 1
+	MaxRouteWorkers                       = 128
+	AbsoluteDefaultPacketChanSize         = 1024
+	AbsoluteDefaultMinPacketChanSize      = 64
+	AbsoluteDefaultMaxPacketChanSize      = 8192
+	AbsoluteDefaultListenSocketBufferSize = 16777216
+	AbsoluteDefaultClientSocketBufferSize = 16777216
 )
 
 const (
@@ -42,12 +44,20 @@ type ProxyServer struct {
 }
 
 type resolvedRoute struct {
-	routeCfg   StreamRoute
-	listenAddr *net.UDPAddr
-	sourceAddr *net.UDPAddr
-	timeout    time.Duration
-	workers    int
-	chanSize   int
+	routeCfg                StreamRoute
+	listenAddr              *net.UDPAddr
+	sourceAddr              *net.UDPAddr
+	timeout                 time.Duration
+	workers                 int
+	chanSize                int
+	listenReadBuffer        int
+	listenWriteBuffer       int
+	clientReadBuffer        int
+	clientWriteBuffer       int
+	listenReadBufferSource  string
+	listenWriteBufferSource string
+	clientReadBufferSource  string
+	clientWriteBufferSource string
 }
 
 func resolveWorkerCount(routeCfg StreamRoute, defaults StreamRoute, routeName string) int {
@@ -141,6 +151,40 @@ func (p *ProxyServer) resolveChannelSize(routeCfg StreamRoute, defaults StreamRo
 	return chanSize
 }
 
+func resolveSocketBuffer(routeName, bufferName string, routeValue *int, defaultValue *int, absoluteDefault int) (size int, source string) {
+	value := absoluteDefault
+	configSource := "absolute default"
+
+	if defaultValue != nil {
+		if *defaultValue > 0 {
+			value = *defaultValue
+			configSource = "'defaults' section"
+			log.Debugf("Route '%s': Using default %s %d bytes from %s", routeName, bufferName, value, configSource)
+		} else {
+			log.Debugf("Route '%s': Ignoring non-positive default %s %d, keeping %s: %d bytes",
+				routeName, bufferName, *defaultValue, configSource, value)
+		}
+	}
+
+	if routeValue != nil {
+		if *routeValue > 0 {
+			value = *routeValue
+			configSource = "route-specific setting"
+			log.Debugf("Route '%s': Using specific %s %d bytes from %s", routeName, bufferName, value, configSource)
+		} else {
+			log.Debugf("Route '%s': Ignoring non-positive route-specific %s %d, keeping value from %s: %d bytes",
+				routeName, bufferName, *routeValue, configSource, value)
+		}
+	}
+
+	if value <= 0 {
+		log.Debugf("Route '%s': Resolved %s is %d (non-positive), letting OS use its default. Source was '%s'.", routeName, bufferName, value, configSource)
+		return 0, configSource
+	}
+
+	return value, configSource
+}
+
 func NewProxyServer(parentCtx context.Context) *ProxyServer {
 	log.Debug("Creating new Proxy Server")
 	p := &ProxyServer{
@@ -182,6 +226,10 @@ func (p *ProxyServer) Start(cfg *Config) error {
 			resRoute.timeout,
 			resRoute.workers,
 			resRoute.chanSize,
+			resRoute.listenReadBuffer, resRoute.listenReadBufferSource,
+			resRoute.listenWriteBuffer, resRoute.listenWriteBufferSource,
+			resRoute.clientReadBuffer,
+			resRoute.clientWriteBuffer,
 		)
 		if err != nil {
 			log.Errorf("Start: Failed to start route '%s' (%s -> %s): %v",
@@ -206,7 +254,18 @@ func (p *ProxyServer) Start(cfg *Config) error {
 	return nil
 }
 
-func (p *ProxyServer) startRouteLocked(routeName string, listenAddr *net.UDPAddr, sourceAddr *net.UDPAddr, timeout time.Duration, workers int, chanSize int) error {
+func (p *ProxyServer) startRouteLocked(
+	routeName string,
+	listenAddr *net.UDPAddr,
+	sourceAddr *net.UDPAddr,
+	timeout time.Duration,
+	workers int,
+	chanSize int,
+	listenReadBuf int, listenReadSrc string,
+	listenWriteBuf int, listenWriteSrc string,
+	clientReadBuf int,
+	clientWriteBuf int,
+) error {
 	listenAddrStr := listenAddr.String()
 	sourceAddrStr := sourceAddr.String()
 
@@ -220,24 +279,69 @@ func (p *ProxyServer) startRouteLocked(routeName string, listenAddr *net.UDPAddr
 		return fmt.Errorf("listen on %s failed for route '%s': %w", listenAddrStr, routeName, err)
 	}
 
-	log.Infof("Route '%s': Listening on %s, forwarding new flows to %s (Timeout: %v, Workers: %d, ChanSize: %d)",
-		routeName, listenAddrStr, sourceAddrStr, timeout, workers, chanSize)
+	listenBufLog := ""
+
+	finalListenReadBuf := 0
+	finalListenWriteBuf := 0
+
+	if listenReadBuf > 0 {
+		err := listener.SetReadBuffer(listenReadBuf)
+		if err != nil {
+			log.Debugf("Route '%s' (%s): Failed to set listener read buffer to %d bytes (requested from %s): %v. OS default will be used.",
+				routeName, listenAddrStr, listenReadBuf, listenReadSrc, err)
+			listenBufLog += fmt.Sprintf(" ReadBufErr(req:%d(%s)):%v", listenReadBuf, listenReadSrc, err)
+		} else {
+			log.Debugf("Route '%s' (%s): Successfully applied listener read buffer size %d bytes (from %s).",
+				routeName, listenAddrStr, listenReadBuf, listenReadSrc)
+			listenBufLog += fmt.Sprintf(" ReadBuf:%d(%s)", listenReadBuf, listenReadSrc)
+			finalListenReadBuf = listenReadBuf
+		}
+	} else {
+		log.Debugf("Route '%s' (%s): Using OS default listener read buffer (requested from %s).",
+			routeName, listenAddrStr, listenReadSrc)
+		listenBufLog += fmt.Sprintf(" ReadBuf:OSDef(%s)", listenReadSrc)
+	}
+
+	if listenWriteBuf > 0 {
+		err := listener.SetWriteBuffer(listenWriteBuf)
+		if err != nil {
+			log.Debugf("Route '%s' (%s): Failed to set listener write buffer to %d bytes (requested from %s): %v. OS default will be used.",
+				routeName, listenAddrStr, listenWriteBuf, listenWriteSrc, err)
+			listenBufLog += fmt.Sprintf(" WriteBufErr(req:%d(%s)):%v", listenWriteBuf, listenWriteSrc, err)
+		} else {
+			log.Debugf("Route '%s' (%s): Successfully applied listener write buffer size %d bytes (from %s).",
+				routeName, listenAddrStr, listenWriteBuf, listenWriteSrc)
+			listenBufLog += fmt.Sprintf(" WriteBuf:%d(%s)", listenWriteBuf, listenWriteSrc)
+			finalListenWriteBuf = listenWriteBuf
+		}
+	} else {
+		log.Debugf("Route '%s' (%s): Using OS default listener write buffer (requested from %s).",
+			routeName, listenAddrStr, listenWriteSrc)
+		listenBufLog += fmt.Sprintf(" WriteBuf:OSDef(%s)", listenWriteSrc)
+	}
+
+	log.Infof("Route '%s': Listening on %s, forwarding new flows to %s (Timeout: %v, Workers: %d, ChanSize: %d, Buffer:%s)",
+		routeName, listenAddrStr, sourceAddrStr, timeout, workers, chanSize, listenBufLog)
 
 	ctx, cancel := context.WithCancel(p.globalCtx)
 
 	log.Debugf("Route '%s': Initializing with %d workers and channel size %d", routeName, workers, chanSize)
 
 	activeRoute := &ActiveRoute{
-		routeName:    routeName,
-		listenAddr:   listenAddr,
-		listener:     listener,
-		targetSource: sourceAddr,
-		flowTimeout:  timeout,
-		ctx:          ctx,
-		cancel:       cancel,
-		numWorkers:   workers,
-		packetChan:   make(chan *packetBuffer, chanSize),
-		clientFlows:  sync.Map{},
+		routeName:         routeName,
+		listenAddr:        listenAddr,
+		listener:          listener,
+		targetSource:      sourceAddr,
+		flowTimeout:       timeout,
+		ctx:               ctx,
+		cancel:            cancel,
+		numWorkers:        workers,
+		packetChan:        make(chan *packetBuffer, chanSize),
+		clientFlows:       sync.Map{},
+		listenReadBuffer:  finalListenReadBuf,
+		listenWriteBuffer: finalListenWriteBuf,
+		clientReadBuffer:  clientReadBuf,
+		clientWriteBuffer: clientWriteBuf,
 	}
 
 	p.activeRoutes[listenAddrStr] = activeRoute
@@ -370,20 +474,39 @@ func (p *ProxyServer) validateAndResolveNewConfig(cfg *Config) (map[string]resol
 		workers := resolveWorkerCount(routeCfg, defaultsConfig, routeCfg.Name)
 		chanSize := p.resolveChannelSize(routeCfg, defaultsConfig, routeCfg.Name)
 
+		listenReadBuf, listenReadSrc := resolveSocketBuffer(routeCfg.Name, "listen_read_buffer",
+			routeCfg.ListenReadBuffer, defaultsConfig.ListenReadBuffer, AbsoluteDefaultListenSocketBufferSize)
+		listenWriteBuf, listenWriteSrc := resolveSocketBuffer(routeCfg.Name, "listen_write_buffer",
+			routeCfg.ListenWriteBuffer, defaultsConfig.ListenWriteBuffer, AbsoluteDefaultListenSocketBufferSize)
+		clientReadBuf, clientReadSrc := resolveSocketBuffer(routeCfg.Name, "client_read_buffer",
+			routeCfg.ClientReadBuffer, defaultsConfig.ClientReadBuffer, AbsoluteDefaultClientSocketBufferSize)
+		clientWriteBuf, clientWriteSrc := resolveSocketBuffer(routeCfg.Name, "client_write_buffer",
+			routeCfg.ClientWriteBuffer, defaultsConfig.ClientWriteBuffer, AbsoluteDefaultClientSocketBufferSize)
+
 		resRoute := resolvedRoute{
-			routeCfg:   routeCfg,
-			listenAddr: listenAddr,
-			sourceAddr: sourceAddr,
-			timeout:    timeout,
-			workers:    workers,
-			chanSize:   chanSize,
+			routeCfg:                routeCfg,
+			listenAddr:              listenAddr,
+			sourceAddr:              sourceAddr,
+			timeout:                 timeout,
+			workers:                 workers,
+			chanSize:                chanSize,
+			listenReadBuffer:        listenReadBuf,
+			listenWriteBuffer:       listenWriteBuf,
+			clientReadBuffer:        clientReadBuf,
+			clientWriteBuffer:       clientWriteBuf,
+			listenReadBufferSource:  listenReadSrc,
+			listenWriteBufferSource: listenWriteSrc,
+			clientReadBufferSource:  clientReadSrc,
+			clientWriteBufferSource: clientWriteSrc,
 		}
 
 		newRouteConfigs[listenAddr.String()] = resRoute
 		uniqueListenAddrs[routeCfg.ListenAddress] = routeCfg.Name
 
-		log.Debugf("Config Validation: Resolved new/updated route '%s': Listen=%s Source=%s Timeout=%v Workers=%d ChanSize=%d",
-			routeCfg.Name, listenAddr.String(), sourceAddr.String(), timeout, workers, chanSize)
+		log.Debugf("Config Validation: Resolved route '%s': Listen=%s Source=%s Timeout=%v Workers=%d ChanSize=%d ListenBuf(R:%d(%s)/W:%d(%s)) ClientBuf(R:%d(%s)/W:%d(%s))",
+			routeCfg.Name, listenAddr.String(), sourceAddr.String(), timeout, workers, chanSize,
+			listenReadBuf, listenReadSrc, listenWriteBuf, listenWriteSrc,
+			clientReadBuf, clientReadSrc, clientWriteBuf, clientWriteSrc)
 	}
 	return newRouteConfigs, hasInvalidRoute
 }
@@ -446,8 +569,9 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 
 			activeRoute.configLock.RUnlock()
 
-			log.Debugf("Reload: Route '%s' (%s) exists, checking for updates (New: Name='%s' Source=%s, Workers=%d, Timeout=%v, ChanSize=%d)",
-				oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.timeout, newRouteData.chanSize)
+			log.Debugf("Reload: Route '%s' (%s) exists, checking for updates (New: Name='%s' Source=%s, Workers=%d, Timeout=%v, ChanSize=%d, LBuf=%d/%d, CBuf=%d/%d)",
+				oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.timeout, newRouteData.chanSize,
+				newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
 
 			sourceChanged := oldSourceStr != newRouteData.sourceAddr.String()
 
@@ -462,14 +586,17 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 				if workersChanged {
 					reason += fmt.Sprintf("Worker count changed (%d -> %d). ", oldWorkers, newRouteData.workers)
 				}
-				log.Infof("Reload: %sRoute '%s' (%s) requires RESTART. Applying new settings (Name: '%s', ChanSize: %d).",
-					reason, oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.chanSize)
+				log.Infof("Reload: %sRoute '%s' (%s) requires RESTART. Applying new settings (Name: '%s', ChanSize: %d, LBuf=%d/%d, CBuf=%d/%d).",
+					reason, oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.chanSize,
+					newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
 
 				activeRoute.Stop()
 				delete(p.activeRoutes, listenAddrStr)
 
-				log.Infof("Reload: Restarting route '%s' with new config (Listen: %s, Source: %s, Workers: %d, ChanSize: %d, Timeout: %v)",
-					newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.chanSize, newRouteData.timeout)
+				log.Infof("Reload: Restarting route '%s' with new config (Listen: %s, Source: %s, Workers: %d, ChanSize: %d, Timeout: %v, LBuf=%d/%d, CBuf=%d/%d)",
+					newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.chanSize, newRouteData.timeout,
+					newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
+
 				err := p.startRouteLocked(
 					newRouteData.routeCfg.Name,
 					newRouteData.listenAddr,
@@ -477,6 +604,10 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 					newRouteData.timeout,
 					newRouteData.workers,
 					newRouteData.chanSize,
+					newRouteData.listenReadBuffer, newRouteData.listenReadBufferSource,
+					newRouteData.listenWriteBuffer, newRouteData.listenWriteBufferSource,
+					newRouteData.clientReadBuffer,
+					newRouteData.clientWriteBuffer,
 				)
 				if err != nil {
 					log.Errorf("Reload: Failed to RESTART route '%s': %v", newRouteData.routeCfg.Name, err)
@@ -489,8 +620,9 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 				p.updateRouteInPlaceLocked(activeRoute, newRouteData)
 			}
 		} else {
-			log.Infof("Reload: Starting new route '%s' (Listen: %s, Source: %s, Workers: %d, ChanSize: %d, Timeout: %v)",
-				newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.chanSize, newRouteData.timeout)
+			log.Infof("Reload: Starting new route '%s' (Listen: %s, Source: %s, Workers: %d, ChanSize: %d, Timeout: %v, LBuf=%d/%d, CBuf=%d/%d)",
+				newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.chanSize, newRouteData.timeout,
+				newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
 			err := p.startRouteLocked(
 				newRouteData.routeCfg.Name,
 				newRouteData.listenAddr,
@@ -498,6 +630,10 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 				newRouteData.timeout,
 				newRouteData.workers,
 				newRouteData.chanSize,
+				newRouteData.listenReadBuffer, newRouteData.listenReadBufferSource,
+				newRouteData.listenWriteBuffer, newRouteData.listenWriteBufferSource,
+				newRouteData.clientReadBuffer,
+				newRouteData.clientWriteBuffer,
 			)
 			if err != nil {
 				log.Errorf("Reload: Failed to start new route '%s': %v", newRouteData.routeCfg.Name, err)
@@ -533,6 +669,12 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 	nameChanged := oldName != newRouteData.routeCfg.Name
 	timeoutChanged := oldTimeout != newRouteData.timeout
 
+	oldListenReadBuf := activeRoute.listenReadBuffer
+	oldListenWriteBuf := activeRoute.listenWriteBuffer
+	oldClientReadBuf := activeRoute.clientReadBuffer
+	oldClientWriteBuf := activeRoute.clientWriteBuffer
+	listener := activeRoute.listener
+
 	updatedFieldsLog := ""
 	if nameChanged {
 		activeRoute.routeName = newRouteData.routeCfg.Name
@@ -544,10 +686,83 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 
 	}
 
+	listenerBufChanged := false
+	newListenReadBuf := newRouteData.listenReadBuffer
+	newListenReadSrc := newRouteData.listenReadBufferSource
+
+	if listener != nil && oldListenReadBuf != newListenReadBuf {
+		listenerBufChanged = true
+		log.Debugf("Reload: Route '%s' (%s): Attempting to update listener read buffer from %d to %d (requested from %s)",
+			activeRoute.routeName, listenAddrStr, oldListenReadBuf, newListenReadBuf, newListenReadSrc)
+		if newListenReadBuf > 0 {
+			err := listener.SetReadBuffer(newListenReadBuf)
+			if err != nil {
+				log.Debugf("Reload: Route '%s' (%s): Failed to update listener read buffer to %d (requested from %s): %v. Previous value %d remains.",
+					activeRoute.routeName, listenAddrStr, newListenReadBuf, newListenReadSrc, err, oldListenReadBuf)
+				updatedFieldsLog += fmt.Sprintf(" ListenReadBufErr(req:%d(%s)):%v", newListenReadBuf, newListenReadSrc, err)
+			} else {
+				log.Debugf("Reload: Route '%s' (%s): Successfully applied listener read buffer update to %d (from %s).",
+					activeRoute.routeName, listenAddrStr, newListenReadBuf, newListenReadSrc)
+				activeRoute.listenReadBuffer = newListenReadBuf
+				updatedFieldsLog += fmt.Sprintf(" ListenReadBuf:%d(%s)", newListenReadBuf, newListenReadSrc)
+			}
+		} else {
+			log.Debugf("Reload: Route '%s' (%s): Requested listener read buffer set to OS default (requested from %s). Previous was %d.",
+				activeRoute.routeName, listenAddrStr, newListenReadSrc, oldListenReadBuf)
+			activeRoute.listenReadBuffer = 0
+			updatedFieldsLog += fmt.Sprintf(" ListenReadBuf:OSDef(%s)", newListenReadSrc)
+		}
+	}
+
+	newListenWriteBuf := newRouteData.listenWriteBuffer
+	newListenWriteSrc := newRouteData.listenWriteBufferSource
+	if listener != nil && oldListenWriteBuf != newListenWriteBuf {
+		listenerBufChanged = true
+		log.Debugf("Reload: Route '%s' (%s): Attempting to update listener write buffer from %d to %d (requested from %s)",
+			activeRoute.routeName, listenAddrStr, oldListenWriteBuf, newListenWriteBuf, newListenWriteSrc)
+		if newListenWriteBuf > 0 {
+			err := listener.SetWriteBuffer(newListenWriteBuf)
+			if err != nil {
+				log.Debugf("Reload: Route '%s' (%s): Failed to update listener write buffer to %d (requested from %s): %v. Previous value %d remains.",
+					activeRoute.routeName, listenAddrStr, newListenWriteBuf, newListenWriteSrc, err, oldListenWriteBuf)
+				updatedFieldsLog += fmt.Sprintf(" ListenWriteBufErr(req:%d(%s)):%v", newListenWriteBuf, newListenWriteSrc, err)
+			} else {
+				log.Debugf("Reload: Route '%s' (%s): Successfully applied listener write buffer update to %d (from %s).",
+					activeRoute.routeName, listenAddrStr, newListenWriteBuf, newListenWriteSrc)
+				activeRoute.listenWriteBuffer = newListenWriteBuf
+				updatedFieldsLog += fmt.Sprintf(" ListenWriteBuf:%d(%s)", newListenWriteBuf, newListenWriteSrc)
+			}
+		} else {
+			log.Debugf("Reload: Route '%s' (%s): Requested listener write buffer set to OS default (requested from %s). Previous was %d.",
+				activeRoute.routeName, listenAddrStr, newListenWriteSrc, oldListenWriteBuf)
+			activeRoute.listenWriteBuffer = 0
+			updatedFieldsLog += fmt.Sprintf(" ListenWriteBuf:OSDef(%s)", newListenWriteSrc)
+		}
+	}
+
+	if listenerBufChanged {
+		log.Debugf("Reload: Route '%s' (%s): Listener buffer update check complete.", activeRoute.routeName, listenAddrStr)
+	}
+
+	clientBufChanged := false
+	if oldClientReadBuf != newRouteData.clientReadBuffer {
+		clientBufChanged = true
+		activeRoute.clientReadBuffer = newRouteData.clientReadBuffer
+		updatedFieldsLog += fmt.Sprintf(" ClientReadBufTemplate:%d", activeRoute.clientReadBuffer)
+	}
+	if oldClientWriteBuf != newRouteData.clientWriteBuffer {
+		clientBufChanged = true
+		activeRoute.clientWriteBuffer = newRouteData.clientWriteBuffer
+		updatedFieldsLog += fmt.Sprintf(" ClientWriteBufTemplate:%d", activeRoute.clientWriteBuffer)
+	}
+	if clientBufChanged {
+		log.Debugf("Reload: Route '%s' (%s): Client buffer templates updated.", activeRoute.routeName, listenAddrStr)
+	}
+
 	if updatedFieldsLog != "" {
 		log.Infof("Reload: Updated existing route '%s' (%s) in-place:%s", activeRoute.routeName, listenAddrStr, updatedFieldsLog)
 	} else {
-		log.Debugf("Reload: Route '%s' (%s) configuration requires no in-place update (Name, Timeout) and no restart (Source, Workers).", activeRoute.routeName, listenAddrStr)
+		log.Debugf("Reload: Route '%s' (%s) configuration requires no in-place update (Name, Timeout, Buffers) and no restart (Source, Workers).", activeRoute.routeName, listenAddrStr)
 	}
 }
 

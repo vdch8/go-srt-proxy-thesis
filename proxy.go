@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -22,7 +23,7 @@ const (
 	AbsoluteDefaultMinPacketChanSize      = 64
 	AbsoluteDefaultMaxPacketChanSize      = 8192
 	AbsoluteDefaultListenSocketBufferSize = 16777216
-	AbsoluteDefaultClientSocketBufferSize = 16777216
+	AbsoluteDefaultClientSocketBufferSize = 212992
 )
 
 const (
@@ -563,7 +564,6 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 
 		if exists {
 			activeRoute.configLock.RLock()
-			oldSourceStr := activeRoute.targetSource.String()
 			oldWorkers := activeRoute.numWorkers
 			oldName := activeRoute.routeName
 
@@ -573,28 +573,32 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 				oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.timeout, newRouteData.chanSize,
 				newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
 
-			sourceChanged := oldSourceStr != newRouteData.sourceAddr.String()
+			resolvedNewWorkers := newRouteData.workers
+			workersCountChanged := oldWorkers != resolvedNewWorkers
 
-			workersChanged := oldWorkers != newRouteData.workers
+			requiresRestart := false
+			restartReason := ""
 
-			if sourceChanged || workersChanged {
+			if workersCountChanged && newRouteData.routeCfg.Workers != nil {
+				requiresRestart = true
+				restartReason = fmt.Sprintf("Explicit workers setting changed (%d -> %d). ", oldWorkers, resolvedNewWorkers)
 
-				reason := ""
-				if sourceChanged {
-					reason += fmt.Sprintf("Source address changed ('%s' -> '%s'). ", oldSourceStr, newRouteData.sourceAddr.String())
-				}
-				if workersChanged {
-					reason += fmt.Sprintf("Worker count changed (%d -> %d). ", oldWorkers, newRouteData.workers)
-				}
-				log.Infof("Reload: %sRoute '%s' (%s) requires RESTART. Applying new settings (Name: '%s', ChanSize: %d, LBuf=%d/%d, CBuf=%d/%d).",
-					reason, oldName, listenAddrStr, newRouteData.routeCfg.Name, newRouteData.chanSize,
-					newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
+				log.Infof("Reload: Route '%s' (%s) requires RESTART due to explicit worker count change.", oldName, listenAddrStr)
+			} else if workersCountChanged {
+
+				log.Warnf("Reload: Route '%s' (%s): Effective worker count changed (%d -> %d) due to 'defaults.workers'. "+
+					"Change will NOT be applied immediately to prevent disruption. Route continues with %d workers.",
+					oldName, listenAddrStr, oldWorkers, resolvedNewWorkers, oldWorkers)
+			}
+
+			if requiresRestart {
+				log.Infof("Reload: %sRoute '%s' (%s) is being RESTARTED.", restartReason, oldName, listenAddrStr)
 
 				activeRoute.Stop()
 				delete(p.activeRoutes, listenAddrStr)
 
 				log.Infof("Reload: Restarting route '%s' with new config (Listen: %s, Source: %s, Workers: %d, ChanSize: %d, Timeout: %v, LBuf=%d/%d, CBuf=%d/%d)",
-					newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), newRouteData.workers, newRouteData.chanSize, newRouteData.timeout,
+					newRouteData.routeCfg.Name, listenAddrStr, newRouteData.sourceAddr.String(), resolvedNewWorkers, newRouteData.chanSize, newRouteData.timeout,
 					newRouteData.listenReadBuffer, newRouteData.listenWriteBuffer, newRouteData.clientReadBuffer, newRouteData.clientWriteBuffer)
 
 				err := p.startRouteLocked(
@@ -602,7 +606,7 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 					newRouteData.listenAddr,
 					newRouteData.sourceAddr,
 					newRouteData.timeout,
-					newRouteData.workers,
+					resolvedNewWorkers,
 					newRouteData.chanSize,
 					newRouteData.listenReadBuffer, newRouteData.listenReadBufferSource,
 					newRouteData.listenWriteBuffer, newRouteData.listenWriteBufferSource,
@@ -613,10 +617,10 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 					log.Errorf("Reload: Failed to RESTART route '%s': %v", newRouteData.routeCfg.Name, err)
 					hasFailures = true
 				} else {
-					log.Infof("Reload: Route '%s' restarted successfully.", newRouteData.routeCfg.Name)
+					log.Infof("Reload: Route '%s' restarted successfully with %d workers.", newRouteData.routeCfg.Name, resolvedNewWorkers)
 				}
 			} else {
-
+				log.Debugf("Reload: Applying updates in-place for route '%s' (%s).", oldName, listenAddrStr)
 				p.updateRouteInPlaceLocked(activeRoute, newRouteData)
 			}
 		} else {
@@ -649,8 +653,9 @@ func (p *ProxyServer) processNewAndUpdatedRoutesLocked(newRouteConfigs map[strin
 		for k, v := range p.activeRoutes {
 			v.configLock.RLock()
 			rName := v.routeName
+			rWorkers := v.numWorkers
 			v.configLock.RUnlock()
-			finalActive = append(finalActive, fmt.Sprintf("'%s'(%s)", rName, k))
+			finalActive = append(finalActive, fmt.Sprintf("'%s'(%s, %dw)", rName, k, rWorkers))
 		}
 		log.Debugf("Reload: Final active routes after processing: %v", finalActive)
 	}
@@ -664,16 +669,12 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 
 	oldName := activeRoute.routeName
 	oldTimeout := activeRoute.flowTimeout
+	oldTargetSource := activeRoute.targetSource
 	listenAddrStr := activeRoute.listenAddr.String()
 
 	nameChanged := oldName != newRouteData.routeCfg.Name
 	timeoutChanged := oldTimeout != newRouteData.timeout
-
-	oldListenReadBuf := activeRoute.listenReadBuffer
-	oldListenWriteBuf := activeRoute.listenWriteBuffer
-	oldClientReadBuf := activeRoute.clientReadBuffer
-	oldClientWriteBuf := activeRoute.clientWriteBuffer
-	listener := activeRoute.listener
+	targetSourceChanged := oldTargetSource.String() != newRouteData.sourceAddr.String()
 
 	updatedFieldsLog := ""
 	if nameChanged {
@@ -682,13 +683,22 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 	}
 	if timeoutChanged {
 		activeRoute.flowTimeout = newRouteData.timeout
-		updatedFieldsLog += fmt.Sprintf(" Timeout: %v->%v", oldTimeout, activeRoute.flowTimeout)
-
+		updatedFieldsLog += fmt.Sprintf(" Timeout: %v->%v (applies dynamically)", oldTimeout, activeRoute.flowTimeout)
+	}
+	if targetSourceChanged {
+		activeRoute.targetSource = newRouteData.sourceAddr
+		updatedFieldsLog += fmt.Sprintf(" TargetSource: '%s'->'%s' (for new flows)", oldTargetSource.String(), activeRoute.targetSource.String())
 	}
 
-	listenerBufChanged := false
+	listener := activeRoute.listener
+	oldListenReadBuf := activeRoute.listenReadBuffer
+	oldListenWriteBuf := activeRoute.listenWriteBuffer
 	newListenReadBuf := newRouteData.listenReadBuffer
 	newListenReadSrc := newRouteData.listenReadBufferSource
+	newListenWriteBuf := newRouteData.listenWriteBuffer
+	newListenWriteSrc := newRouteData.listenWriteBufferSource
+
+	listenerBufChanged := false
 
 	if listener != nil && oldListenReadBuf != newListenReadBuf {
 		listenerBufChanged = true
@@ -714,8 +724,6 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 		}
 	}
 
-	newListenWriteBuf := newRouteData.listenWriteBuffer
-	newListenWriteSrc := newRouteData.listenWriteBufferSource
 	if listener != nil && oldListenWriteBuf != newListenWriteBuf {
 		listenerBufChanged = true
 		log.Debugf("Reload: Route '%s' (%s): Attempting to update listener write buffer from %d to %d (requested from %s)",
@@ -744,25 +752,39 @@ func (p *ProxyServer) updateRouteInPlaceLocked(activeRoute *ActiveRoute, newRout
 		log.Debugf("Reload: Route '%s' (%s): Listener buffer update check complete.", activeRoute.routeName, listenAddrStr)
 	}
 
-	clientBufChanged := false
-	if oldClientReadBuf != newRouteData.clientReadBuffer {
-		clientBufChanged = true
-		activeRoute.clientReadBuffer = newRouteData.clientReadBuffer
+	oldClientReadBuf := activeRoute.clientReadBuffer
+	oldClientWriteBuf := activeRoute.clientWriteBuffer
+	newClientReadBuf := newRouteData.clientReadBuffer
+	newClientWriteBuf := newRouteData.clientWriteBuffer
+
+	clientReadBufChanged := oldClientReadBuf != newClientReadBuf
+	clientWriteBufChanged := oldClientWriteBuf != newClientWriteBuf
+
+	if clientReadBufChanged {
+		activeRoute.clientReadBuffer = newClientReadBuf
 		updatedFieldsLog += fmt.Sprintf(" ClientReadBufTemplate:%d", activeRoute.clientReadBuffer)
 	}
-	if oldClientWriteBuf != newRouteData.clientWriteBuffer {
-		clientBufChanged = true
-		activeRoute.clientWriteBuffer = newRouteData.clientWriteBuffer
+	if clientWriteBufChanged {
+		activeRoute.clientWriteBuffer = newClientWriteBuf
 		updatedFieldsLog += fmt.Sprintf(" ClientWriteBufTemplate:%d", activeRoute.clientWriteBuffer)
 	}
-	if clientBufChanged {
+
+	if clientReadBufChanged || clientWriteBufChanged {
 		log.Debugf("Reload: Route '%s' (%s): Client buffer templates updated.", activeRoute.routeName, listenAddrStr)
 	}
 
 	if updatedFieldsLog != "" {
 		log.Infof("Reload: Updated existing route '%s' (%s) in-place:%s", activeRoute.routeName, listenAddrStr, updatedFieldsLog)
 	} else {
-		log.Debugf("Reload: Route '%s' (%s) configuration requires no in-place update (Name, Timeout, Buffers) and no restart (Source, Workers).", activeRoute.routeName, listenAddrStr)
+		log.Debugf("Reload: Route '%s' (%s) configuration requires no in-place update (Name, Timeout, TargetSource, ListenBuf, ClientBufTemplate) and no restart (Workers).",
+			activeRoute.routeName, listenAddrStr)
+	}
+
+	if clientReadBufChanged || clientWriteBufChanged {
+		applyClientBufferUpdatesToFlows(activeRoute, newClientReadBuf, newClientWriteBuf, clientReadBufChanged, clientWriteBufChanged)
+	} else {
+		log.Debugf("Reload: Route '%s' (%s): Skipping application of client buffers to flows as templates did not change.",
+			activeRoute.routeName, listenAddrStr)
 	}
 }
 
@@ -901,4 +923,108 @@ func (p *ProxyServer) Stop() {
 	log.Info("Flow cleaner finished.")
 
 	log.Info("Proxy server shutdown complete.")
+}
+
+func applyClientBufferUpdatesToFlows(ar *ActiveRoute, newReadBuf, newWriteBuf int, readChanged, writeChanged bool) {
+
+	routeName := ar.routeName
+	listenAddrStr := "unknown"
+	if ar.listenAddr != nil {
+		listenAddrStr = ar.listenAddr.String()
+	}
+
+	applyCount := 0
+	failCount := 0
+	flowCount := 0
+
+	log.Debugf("Reload: Route '%s' (%s): Applying client buffer updates (R:%d, W:%d, readChanged:%t, writeChanged:%t) to existing flows...",
+		routeName, listenAddrStr, newReadBuf, newWriteBuf, readChanged, writeChanged)
+
+	ar.clientFlows.Range(func(key, value any) bool {
+		flowCount++
+		clientKey := key.(string)
+		flow, ok := value.(*ClientFlow)
+		if !ok {
+			log.Warnf("Reload/BufferApply: Found unexpected type (%T) in clientFlows map for key %s on route '%s'. Skipping.", value, clientKey, routeName)
+			return true
+		}
+
+		select {
+		case <-flow.flowCtx.Done():
+			log.Tracef("Reload/BufferApply: Skipping flow %s on route '%s' - context already done.", clientKey, routeName)
+			return true
+		default:
+		}
+
+		outConn := flow.outConn
+		if outConn == nil {
+			log.Warnf("Reload/BufferApply: Flow %s on route '%s' has nil outConn while potentially active. Skipping.", clientKey, routeName)
+			return true
+		}
+
+		appliedToThisFlow := false
+
+		if readChanged {
+			if newReadBuf > 0 {
+				err := outConn.SetReadBuffer(newReadBuf)
+				if err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						log.Tracef("Reload/BufferApply: Failed to set client read buffer to %d for flow %s (%s): %v",
+							newReadBuf, clientKey, routeName, err)
+						failCount++
+					} else {
+						log.Tracef("Reload/BufferApply: Skipped setting read buffer for closed flow %s (%s).", clientKey, routeName)
+					}
+				} else {
+					log.Tracef("Reload/BufferApply: Successfully set client read buffer to %d for flow %s (%s)",
+						newReadBuf, clientKey, routeName)
+					appliedToThisFlow = true
+				}
+			} else {
+				log.Tracef("Reload/BufferApply: Requested client read buffer is OS default for flow %s (%s), not changing existing socket.",
+					clientKey, routeName)
+			}
+		} else if newReadBuf > 0 {
+			log.Tracef("Reload/BufferApply: Client read buffer (%d) did not change for flow %s (%s), skipping SetReadBuffer call.",
+				newReadBuf, clientKey, routeName)
+		}
+
+		if writeChanged {
+			if newWriteBuf > 0 {
+				err := outConn.SetWriteBuffer(newWriteBuf)
+				if err != nil {
+					if !errors.Is(err, net.ErrClosed) {
+						log.Tracef("Reload/BufferApply: Failed to set client write buffer to %d for flow %s (%s): %v",
+							newWriteBuf, clientKey, routeName, err)
+						failCount++
+					} else {
+						log.Tracef("Reload/BufferApply: Skipped setting write buffer for closed flow %s (%s).", clientKey, routeName)
+					}
+				} else {
+					log.Tracef("Reload/BufferApply: Successfully set client write buffer to %d for flow %s (%s)",
+						newWriteBuf, clientKey, routeName)
+					appliedToThisFlow = true
+				}
+			} else {
+				log.Tracef("Reload/BufferApply: Requested client write buffer is OS default for flow %s (%s), not changing existing socket.",
+					clientKey, routeName)
+			}
+		} else if newWriteBuf > 0 {
+			log.Tracef("Reload/BufferApply: Client write buffer (%d) did not change for flow %s (%s), skipping SetWriteBuffer call.",
+				newWriteBuf, clientKey, routeName)
+		}
+
+		if appliedToThisFlow {
+			applyCount++
+		}
+
+		return true
+	})
+
+	if flowCount > 0 {
+		log.Debugf("Reload: Route '%s' (%s): Finished applying client buffer updates to %d iterated flows. Succeeded for %d flows (at least one buffer set), failed for %d operations (excluding closed conns).",
+			routeName, listenAddrStr, flowCount, applyCount, failCount)
+	} else {
+		log.Debugf("Reload: Route '%s' (%s): No active flows found to apply client buffer updates.", routeName, listenAddrStr)
+	}
 }

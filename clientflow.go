@@ -18,9 +18,9 @@ type ClientFlow struct {
 	flowWg         sync.WaitGroup
 	parentListener *net.UDPConn
 	routeName      string
-	routeTimeout   time.Duration
-	parentRoute    *ActiveRoute
-	stopOnce       sync.Once
+	//routeTimeout   time.Duration
+	parentRoute *ActiveRoute
+	stopOnce    sync.Once
 }
 
 func (cf *ClientFlow) reverseListenerLoop() {
@@ -39,8 +39,8 @@ func (cf *ClientFlow) reverseListenerLoop() {
 		}
 	}
 
-	log.Debugf("Route '%s': Starting reverse listener loop for flow %s (%s <- %s), timeout: %v",
-		routeName, clientAddrStr, localEphemAddrStr, sourceAddrStr, cf.routeTimeout)
+	log.Debugf("Route '%s': Starting reverse listener loop for flow %s (%s <- %s),",
+		routeName, clientAddrStr, localEphemAddrStr, sourceAddrStr)
 	defer log.Debugf("Route '%s': Reverse listener loop finished for flow %s (%s <- %s)",
 		routeName, clientAddrStr, localEphemAddrStr, sourceAddrStr)
 
@@ -63,18 +63,30 @@ func (cf *ClientFlow) reverseListenerLoop() {
 			return
 		}
 
+		var currentTimeout time.Duration
+		if cf.parentRoute != nil {
+			cf.parentRoute.configLock.RLock()
+			currentTimeout = cf.parentRoute.flowTimeout
+			cf.parentRoute.configLock.RUnlock()
+		} else {
+			log.Errorf("Route '%s': BUG: parentRoute is nil for active flow %s. Cannot get timeout. Stopping flow.", routeName, clientAddrStr)
+			putPacketBuffer(pb)
+			go cf.Stop()
+			return
+		}
+
 		var deadline time.Time
-		if cf.routeTimeout > 0 {
-			deadline = time.Now().Add(cf.routeTimeout)
+		if currentTimeout > 0 {
+			deadline = time.Now().Add(currentTimeout)
 			err := currentOutConn.SetReadDeadline(deadline)
 			if err != nil {
+				putPacketBuffer(pb)
 				if errors.Is(err, net.ErrClosed) {
 					log.Debugf("Route '%s': Failed to set read deadline on outConn for flow %s: connection already closed. Exiting loop.", routeName, clientAddrStr)
-					putPacketBuffer(pb)
 					return
 				}
-				log.Errorf("Route '%s': Failed to set read deadline on outConn for flow %s: %v. Stopping flow.", routeName, clientAddrStr, err)
-				putPacketBuffer(pb)
+				log.Errorf("Route '%s': Failed to set read deadline (%v) on outConn for flow %s: %v. Stopping flow.",
+					routeName, currentTimeout, clientAddrStr, err)
 				go cf.Stop()
 				return
 			}
@@ -99,7 +111,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 
 			if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
 				log.Infof("Route '%s': Flow for client %s timed out (no data from source %s for %v). Stopping flow.",
-					routeName, clientAddrStr, sourceAddrStr, cf.routeTimeout)
+					routeName, clientAddrStr, sourceAddrStr, currentTimeout)
 				go cf.Stop()
 				return
 			}
@@ -150,6 +162,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 			if errors.Is(writeErr, net.ErrClosed) {
 				log.Infof("Route '%s': Write to client %s failed: parent listener %s closed (route likely stopping). Exiting reverse flow.",
 					routeName, clientAddrStr, parentListenerLocalAddr)
+				go cf.Stop()
 				return
 			} else if errors.Is(writeErr, syscall.EPIPE) || errors.Is(writeErr, syscall.ECONNREFUSED) || errors.Is(writeErr, syscall.ENETUNREACH) || errors.Is(writeErr, syscall.EHOSTUNREACH) {
 				log.Warnf("Route '%s': Write to client %s failed: %v. Stopping flow and exiting reverse loop.",
@@ -159,6 +172,7 @@ func (cf *ClientFlow) reverseListenerLoop() {
 			} else {
 				log.Errorf("Route '%s': Error writing to client %s via %s (from source %s): %v",
 					routeName, clientAddrStr, parentListenerLocalAddr, sourceAddrStr, writeErr)
+				go cf.Stop()
 				return
 			}
 		} else {

@@ -183,15 +183,14 @@ func (ar *ActiveRoute) handleClientPacket(pb *packetBuffer) {
 
 	ar.configLock.RLock()
 	routeName := ar.routeName
-	targetSource := ar.targetSource
-	flowTimeout := ar.flowTimeout
+	currentTargetSource := ar.targetSource
 	parentListener := ar.listener
 	listenerAddrStr := "unknown"
 	if parentListener != nil && parentListener.LocalAddr() != nil {
 		listenerAddrStr = parentListener.LocalAddr().String()
 	}
-	clientReadBuf := ar.clientReadBuffer
-	clientWriteBuf := ar.clientWriteBuffer
+	currentClientReadBuf := ar.clientReadBuffer
+	currentClientWriteBuf := ar.clientWriteBuffer
 	ar.configLock.RUnlock()
 
 	logSRTPacket(clientAddr, pb.Data[:pb.N], false, routeName, listenerAddrStr)
@@ -232,7 +231,14 @@ func (ar *ActiveRoute) handleClientPacket(pb *packetBuffer) {
 		log.Debugf("Route '%s': First packet from new client %s validated as SRT Handshake. Proceeding to create flow.",
 			routeName, clientAddrStr)
 
-		ar.createNewFlowAndProcessPacket(pb, routeName, targetSource, flowTimeout, parentListener, clientReadBuf, clientWriteBuf)
+		ar.createNewFlowAndProcessPacket(
+			pb,
+			routeName,
+			currentTargetSource,
+			parentListener,
+			currentClientReadBuf,
+			currentClientWriteBuf,
+		)
 	}
 }
 
@@ -298,7 +304,14 @@ func (ar *ActiveRoute) processPacketForExistingFlow(flow *ClientFlow, pb *packet
 	}
 }
 
-func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName string, targetSource *net.UDPAddr, flowTimeout time.Duration, parentListener *net.UDPConn, clientReadBuf, clientWriteBuf int) {
+func (ar *ActiveRoute) createNewFlowAndProcessPacket(
+	pb *packetBuffer,
+	routeName string,
+	targetSource *net.UDPAddr,
+	parentListener *net.UDPConn,
+	clientReadBuf int,
+	clientWriteBuf int,
+) {
 	clientAddr := pb.RemoteAddr
 	clientAddrStr := clientAddr.String()
 	targetSourceStr := targetSource.String()
@@ -364,7 +377,6 @@ func (ar *ActiveRoute) createNewFlowAndProcessPacket(pb *packetBuffer, routeName
 		flowCancel:     flowCancel,
 		parentListener: parentListener,
 		routeName:      routeName,
-		routeTimeout:   flowTimeout,
 		parentRoute:    ar,
 	}
 
